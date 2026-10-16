@@ -1,0 +1,24 @@
+# Local build and scratch output
+/bin/
+/dist/
+/.dist/
+/server
+/server.exe
+
+# Go test binaries and coverage reports
+*.test
+*.test.exe
+/coverage.out
+/coverage.html
+
+# Local environment files; keep example configuration trackable
+.env
+.env.*
+!.env.example
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+
+*.md
+!README.md
