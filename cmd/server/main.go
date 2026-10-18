@@ -13,18 +13,27 @@ import (
 
 func main() {
 	mux := http.NewServeMux()
+	store := newMemoryStore()
+	baseURL := "http://127.0.0.1:8080"
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(
+		"POST /api/v1/urls",
+		newCreateURLHandler(store, baseURL, generateCode),
+	)
+
+	mux.HandleFunc("GET /{code}", newRedirectHandler(store))
+
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "OK")
 	})
 
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
+	mux.HandleFunc(
+		"GET /api/v1/urls/{code}",
+		newMetadataHandler(store),
+	)
 
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "Hello, Go!")
 	})
