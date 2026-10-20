@@ -4,6 +4,8 @@ A learning project built by hand with Go and the standard-library `net/http` pac
 
 The current implementation creates short links, redirects them, and returns their metadata using concurrency-safe in-memory storage. It also provides a health endpoint and graceful shutdown. Records are lost whenever the process stops.
 
+Modules 0 through 2 are complete: HTTP foundations, the in-memory MVP, and separation of creation logic from HTTP handling with interface-based storage and automated tests. PostgreSQL persistence is the next roadmap module.
+
 ## Requirements
 
 - Go 1.26.6 or newer, as specified in `go.mod`.
@@ -102,9 +104,49 @@ One store is created at startup and shared by all handlers. It holds a map prote
 
 Codes use six random bytes from `crypto/rand`, encoded as eight URL-safe Base64 characters without padding. Randomness does not guarantee uniqueness. Creation retries with a new code after a collision, up to five attempts total.
 
-The create handler accepts a generator function so tests can force collisions and verify retry exhaustion reliably. Production uses the random generator.
+The create-handler factory accepts a repository and generator function, then constructs one service reused by its returned handler. The service performs allocation and storage. Tests supply controlled generators to force collisions and verify retry exhaustion reliably. Production uses the random generator.
 
 A record is saved before the create response is written. If response writing fails, the record can exist even though the client did not receive confirmation.
+
+## Application structure
+
+The code remains in the `cmd/server` package. Responsibilities are separated into focused files; additional packages will be introduced when useful.
+
+| File | Responsibility |
+| --- | --- |
+| `main.go` | Construct shared dependencies, register routes, and manage server startup and shutdown |
+| `repository.go` | Define the `urlRepository` interface and check that `*memoryStore` satisfies it |
+| `store.go` | Define URL records and implement concurrency-safe in-memory storage |
+| `service.go` | Validate destinations, generate codes, retry collisions, and save records |
+| `create_handler.go` | Decode create requests, call the service, and build HTTP responses |
+| `metadata_handler.go` | Look up records and return metadata as JSON |
+| `redirect_handler.go` | Look up records and return redirects |
+| `request.go` | Decode one JSON request with a body-size limit and unknown-field rejection |
+| `response.go` | Write JSON responses and map service errors to HTTP errors |
+| `validation.go` | Enforce the destination URL policy |
+| `code.go` | Generate random, URL-safe short codes |
+
+Creation follows this flow:
+
+```text
+HTTP request -> decoder -> service -> repository
+                             |
+                       code generator
+
+Service result or error -> HTTP handler -> response helper -> HTTP response
+```
+
+Handlers depend on `urlRepository`, rather than the map implementation. Go checks interface satisfaction implicitly from matching method signatures. Tests can therefore substitute a fake repository to exercise storage failures.
+
+The service has no dependency on HTTP. It returns records or errors, preserving unexpected generator and repository errors with `%w`. The response helper recognizes wrapped application errors with `errors.Is`:
+
+- `errInvalidURL` maps to 400.
+- `errCodeAllocationExhausted` maps to 503.
+- Unexpected service failures are logged internally and map to a generic 500 response.
+
+Request-decoding errors remain in the create handler: oversized bodies map to 413 and other decoding failures to 400. Redirect and metadata handlers currently read from the repository directly.
+
+`writeJSON` sets the content type and commits the caller-selected status before encoding. Encoding or write failures are logged; the helper cannot replace an already committed response with a new error status.
 
 ## Development checks
 
@@ -122,9 +164,27 @@ Automated tests cover:
 - Valid and invalid destination URLs.
 - JSON decoding, unknown fields, trailing values, malformed input, and oversized bodies, including trailing whitespace.
 - Successful creation, rejected requests without storage changes, forced collision retries, and retry exhaustion.
+- Service behavior independent of HTTP: success, validation before generation, generator failure, repository failure, collision retries, and allocation exhaustion.
+- Preservation of wrapped errors with `errors.Is`, plus HTTP error mapping through a fake failing repository.
+- Exactly one JSON value in the successful create response, guarding against duplicate response writes.
 - Metadata responses and redirects for known and missing codes.
 
 The developer reports that these tests pass with the race detector enabled and that vet reports no issues. Manual HTTP checks have verified creation, metadata lookup, redirects, missing records, and the basic endpoints. Handler tests call handlers directly; they do not automatically verify route registration. Passing race checks cover the executions tested, rather than proving every possible concurrent execution correct.
+
+### Coverage
+
+Generate and inspect statement coverage in PowerShell:
+
+```powershell
+go test -race "-coverprofile=coverage.out" ./...
+go tool cover "-func=coverage.out"
+```
+
+Quote the complete flags as shown to avoid argument-parsing problems in PowerShell. The generated `coverage.out` file is ignored by Git.
+
+The developer's latest shared run on October 21, 2026 reported **73.6% total statement coverage**, with all tests passing. The service, repository implementation, handlers, request decoder, validator, and service-error mapping each reported 100%. `generateCode` and `writeJSON` each reported 75%; `main` reported 0%.
+
+Startup and shutdown remain outside the automated suite, and error branches in the random generator and JSON writer remain uncovered. Basic shutdown has been checked manually. Coverage records executed statements; assertions are still needed to establish correct results, and 100% coverage does not prove every edge case is handled.
 
 ## Current limitations
 
@@ -132,6 +192,7 @@ The developer reports that these tests pass with the race detector enabled and t
 - The listen address and public short-link base URL are fixed in application setup.
 - Authentication, rate limiting, persistence, expiry, custom aliases, and analytics are not implemented yet.
 - Metadata currently contains only the short code and original URL.
+- Repository lookup currently returns a record and an existence flag; database failures and request cancellation will require extending that contract for persistence.
 
 ## Shutdown and timeouts
 

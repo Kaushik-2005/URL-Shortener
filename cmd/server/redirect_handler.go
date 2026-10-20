@@ -2,7 +2,7 @@ package main
 
 import "net/http"
 
-func newRedirectHandler(store *memoryStore) http.HandlerFunc {
+func newRedirectHandler(store urlRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
 

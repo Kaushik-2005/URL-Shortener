@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -41,8 +42,15 @@ func TestCreateURLHandlerSuccess(t *testing.T) {
 		ShortURL string `json:"short_url"`
 	}
 
-	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+	decoder := json.NewDecoder(recorder.Body)
+
+	if err := decoder.Decode(&response); err != nil {
 		t.Fatalf("decode response: %v", err)
+	}
+
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		t.Fatalf("expected response to end after one JSON value; got error %v", err)
 	}
 
 	if len(response.Code) != 8 {

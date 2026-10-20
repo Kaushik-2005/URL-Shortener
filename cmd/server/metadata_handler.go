@@ -1,12 +1,10 @@
 package main
 
 import (
-	"encoding/json"
-	"log"
 	"net/http"
 )
 
-func newMetadataHandler(store *memoryStore) http.HandlerFunc {
+func newMetadataHandler(store urlRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
 
@@ -24,10 +22,6 @@ func newMetadataHandler(store *memoryStore) http.HandlerFunc {
 			URL:  record.OriginalURL,
 		}
 
-		w.Header().Set("Content-Type", "application/json")
-
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			log.Printf("Write metadata response: %v", err)
-		}
+		writeJSON(w, http.StatusOK, response)
 	}
 }
