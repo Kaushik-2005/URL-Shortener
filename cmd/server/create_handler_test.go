@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -67,9 +68,9 @@ func TestCreateURLHandlerSuccess(t *testing.T) {
 		t.Errorf("short URL = %q, want %q", response.ShortURL, wantShortURL)
 	}
 
-	record, exists := store.get(response.Code)
-	if !exists {
-		t.Fatal("created record was not saved")
+	record, lookupErr := store.get(context.Background(), response.Code)
+	if lookupErr != nil {
+		t.Fatalf("get created record: %v", lookupErr)
 	}
 
 	if record.Code != response.Code || record.OriginalURL != wantURL {
@@ -165,7 +166,7 @@ func TestCreateURLHandlerRetriesCollision(t *testing.T) {
 		OriginalURL: "https://example.com/original",
 	}
 
-	if err := store.save(original); err != nil {
+	if err := store.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
 	}
 
@@ -216,24 +217,26 @@ func TestCreateURLHandlerRetriesCollision(t *testing.T) {
 		t.Errorf("response code = %q, want fresh456", response.Code)
 	}
 
-	gotOriginal, exists := store.get(original.Code)
-	if !exists || gotOriginal != original {
-		t.Errorf(
-			"original record = (%+v, %t), want (%+v, true)",
-			gotOriginal, exists, original,
-		)
+	gotOriginal, lookupErr := store.get(context.Background(), original.Code)
+	if lookupErr != nil {
+		t.Fatalf("get original record: %v", lookupErr)
+	}
+
+	if gotOriginal != original {
+		t.Errorf("original record = %+v, want %+v", gotOriginal, original)
 	}
 
 	wantNew := urlRecord{
 		Code:        "fresh456",
 		OriginalURL: "https://example.com/new",
 	}
-	gotNew, exists := store.get(wantNew.Code)
-	if !exists || gotNew != wantNew {
-		t.Errorf(
-			"new record = (%+v, %t), want (%+v, true)",
-			gotNew, exists, wantNew,
-		)
+	gotNew, lookupErr := store.get(context.Background(), wantNew.Code)
+	if lookupErr != nil {
+		t.Fatalf("get new record: %v", lookupErr)
+	}
+
+	if gotNew != wantNew {
+		t.Errorf("new record = %+v, want %+v", gotNew, wantNew)
 	}
 }
 
@@ -244,7 +247,7 @@ func TestCreateURLHandlerCollisionLimit(t *testing.T) {
 		OriginalURL: "https://example.com/original",
 	}
 
-	if err := store.save(original); err != nil {
+	if err := store.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
 	}
 
@@ -281,12 +284,13 @@ func TestCreateURLHandlerCollisionLimit(t *testing.T) {
 		t.Errorf("generator calls = %d, want 5", calls)
 	}
 
-	got, exists := store.get(original.Code)
-	if !exists || got != original {
-		t.Errorf(
-			"original record = (%+v, %t), want (%+v, true)",
-			got, exists, original,
-		)
+	got, lookupErr := store.get(context.Background(), original.Code)
+	if lookupErr != nil {
+		t.Fatalf("get original after retry exhaustion: %v", lookupErr)
+	}
+
+	if got != original {
+		t.Errorf("original record = %+v, want %+v", got, original)
 	}
 
 	store.mu.RLock()

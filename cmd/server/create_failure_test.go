@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,13 +14,16 @@ type failingSaveRepository struct {
 	saveCalls int
 }
 
-func (s *failingSaveRepository) save(record urlRecord) error {
+func (s *failingSaveRepository) save(ctx context.Context, record urlRecord) error {
 	s.saveCalls++
 	return s.saveErr
 }
 
-func (s *failingSaveRepository) get(code string) (urlRecord, bool) {
-	return urlRecord{}, false
+func (s *failingSaveRepository) get(
+	ctx context.Context,
+	code string,
+) (urlRecord, error) {
+	return urlRecord{}, errURLNotFound
 }
 
 func TestCreateURLHandlerSaveFailure(t *testing.T) {

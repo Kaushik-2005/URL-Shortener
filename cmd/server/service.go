@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 )
@@ -17,7 +18,7 @@ type urlService struct {
 	generate   func() (string, error)
 }
 
-func (s *urlService) create(rawURL string) (urlRecord, error) {
+func (s *urlService) create(ctx context.Context, rawURL string) (urlRecord, error) {
 	if err := validateURL(rawURL); err != nil {
 		return urlRecord{}, fmt.Errorf("%w: %v", errInvalidURL, err)
 	}
@@ -32,7 +33,7 @@ func (s *urlService) create(rawURL string) (urlRecord, error) {
 
 		record.Code = code
 
-		err = s.repository.save(record)
+		err = s.repository.save(ctx, record)
 		if errors.Is(err, errCodeExists) {
 			continue
 		}

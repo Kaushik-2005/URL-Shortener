@@ -13,7 +13,30 @@ import (
 
 func main() {
 	mux := http.NewServeMux()
-	store := newMemoryStore()
+	var store urlRepository
+
+	switch backend := os.Getenv("STORAGE_BACKEND"); backend {
+	case "", "memory":
+		store = newMemoryStore()
+
+	case "postgres":
+		databaseURL := os.Getenv("DATABASE_URL")
+		if databaseURL == "" {
+			log.Fatal("DATABASE_URL is required for PostgreSQL storage")
+		}
+
+		pool, err := openPostgres(context.Background(), databaseURL)
+		if err != nil {
+			log.Fatalf("Open PostgreSQL: %v", err)
+		}
+		defer pool.Close()
+
+		store = &postgresStore{pool: pool}
+
+	default:
+		log.Fatalf("Unknown STORAGE_BACKEND: %q", backend)
+	}
+
 	baseURL := "http://127.0.0.1:8080"
 
 	mux.HandleFunc(

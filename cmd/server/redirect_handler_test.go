@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -31,7 +32,7 @@ func TestRedirectHandler(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := newMemoryStore()
-			if err := store.save(urlRecord{
+			if err := store.save(context.Background(), urlRecord{
 				Code:        "abc12345",
 				OriginalURL: destination,
 			}); err != nil {

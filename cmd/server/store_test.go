@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -13,13 +14,13 @@ func TestMemoryStoreSaveAndGet(t *testing.T) {
 		OriginalURL: "https://example.com",
 	}
 
-	if err := store.save(want); err != nil {
+	if err := store.save(context.Background(), want); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	got, exists := store.get(want.Code)
-	if !exists {
-		t.Fatal("saved record was not found")
+	got, lookupErr := store.get(context.Background(), want.Code)
+	if lookupErr != nil {
+		t.Fatalf("get saved record: %v", lookupErr)
 	}
 
 	if got != want {
@@ -30,9 +31,13 @@ func TestMemoryStoreSaveAndGet(t *testing.T) {
 func TestMemoryStoreGetMissing(t *testing.T) {
 	store := newMemoryStore()
 
-	_, exists := store.get("missing")
-	if exists {
-		t.Fatal("missing code was reported as existing")
+	got, err := store.get(context.Background(), "missing")
+	if !errors.Is(err, errURLNotFound) {
+		t.Fatalf("error = %v, want errURLNotFound", err)
+	}
+
+	if got != (urlRecord{}) {
+		t.Errorf("record = %+v, want empty record", got)
 	}
 }
 
@@ -47,18 +52,18 @@ func TestMemoryStoreRejectsDuplicateCode(t *testing.T) {
 		OriginalURL: "https://example.com/duplicate",
 	}
 
-	if err := store.save(original); err != nil {
+	if err := store.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
 	}
 
-	err := store.save(duplicate)
+	err := store.save(context.Background(), duplicate)
 	if !errors.Is(err, errCodeExists) {
 		t.Fatalf("save duplicate error = %v, want %v", err, errCodeExists)
 	}
 
-	got, exists := store.get(original.Code)
-	if !exists {
-		t.Fatalf("original record disappeared after collision")
+	got, lookupErr := store.get(context.Background(), original.Code)
+	if lookupErr != nil {
+		t.Fatalf("get original after collision: %v", lookupErr)
 	}
 
 	if got != original {
@@ -81,13 +86,13 @@ func TestMemoryStoreConcurrentAccess(t *testing.T) {
 		go func() {
 			<-start
 
-			err := store.save(record)
+			err := store.save(context.Background(), record)
 
-			got, exists := store.get(record.Code)
-			if !exists {
+			got, lookupErr := store.get(context.Background(), record.Code)
+			if lookupErr != nil || got != record {
 				results <- fmt.Errorf(
-					"get after save = (%+v, %t), want (%+v), true",
-					got, exists, record,
+					"get after save = (%+v, %v), want (%+v, nil)",
+					got, lookupErr, record,
 				)
 				return
 			}

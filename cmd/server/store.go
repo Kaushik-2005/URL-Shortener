@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"sync"
 )
@@ -23,7 +24,11 @@ func newMemoryStore() *memoryStore {
 	}
 }
 
-func (s *memoryStore) save(record urlRecord) error {
+func (s *memoryStore) save(ctx context.Context, record urlRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -35,10 +40,21 @@ func (s *memoryStore) save(record urlRecord) error {
 	return nil
 }
 
-func (s *memoryStore) get(code string) (urlRecord, bool) {
+func (s *memoryStore) get(
+	ctx context.Context,
+	code string,
+) (urlRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if err := ctx.Err(); err != nil {
+		return urlRecord{}, err
+	}
+
 	record, exists := s.urls[code]
-	return record, exists
+	if !exists {
+		return urlRecord{}, errURLNotFound
+	}
+
+	return record, nil
 }

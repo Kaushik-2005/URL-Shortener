@@ -6,9 +6,9 @@ func newRedirectHandler(store urlRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
 
-		record, exists := store.get(code)
-		if !exists {
-			http.NotFound(w, r)
+		record, err := store.get(r.Context(), code)
+		if err != nil {
+			writeServiceError(w, err)
 			return
 		}
 

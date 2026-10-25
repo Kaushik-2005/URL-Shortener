@@ -30,6 +30,8 @@ func writeServiceError(w http.ResponseWriter, err error) {
 			"could not allocate a short code",
 			http.StatusServiceUnavailable,
 		)
+	case errors.Is(err, errURLNotFound):
+		http.Error(w, "404 page not found", http.StatusNotFound)
 	default:
 		log.Printf("Service error: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)

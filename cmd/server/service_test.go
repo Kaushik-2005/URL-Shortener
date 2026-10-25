@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -24,7 +25,7 @@ func TestURLServiceCreateSuccess(t *testing.T) {
 		OriginalURL: "https://example.com/articles/go",
 	}
 
-	got, err := service.create(want.OriginalURL)
+	got, err := service.create(context.Background(), want.OriginalURL)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -33,9 +34,9 @@ func TestURLServiceCreateSuccess(t *testing.T) {
 		t.Errorf("created record = %+v, want %+v", got, want)
 	}
 
-	saved, exists := repository.get(want.Code)
-	if !exists {
-		t.Fatal("created record was not saved")
+	saved, lookupErr := repository.get(context.Background(), want.Code)
+	if lookupErr != nil {
+		t.Fatalf("get saved record: %v", lookupErr)
 	}
 
 	if saved != want {
@@ -83,7 +84,7 @@ func TestURLServiceCreateRejectsInvalidURL(t *testing.T) {
 				},
 			}
 
-			got, err := service.create(tt.url)
+			got, err := service.create(context.Background(), tt.url)
 
 			if !errors.Is(err, errInvalidURL) {
 				t.Fatalf("error = %v, want errInvalidURL", err)
@@ -121,7 +122,7 @@ func TestURLServiceCreateGeneratorFailure(t *testing.T) {
 		},
 	}
 
-	got, err := service.create("https://example.com")
+	got, err := service.create(context.Background(), "https://example.com")
 
 	if !errors.Is(err, generatorErr) {
 		t.Fatalf("error = %v, want wrapped generator error", err)
@@ -159,7 +160,7 @@ func TestURLServiceCreateRepositoryFailure(t *testing.T) {
 		},
 	}
 
-	got, err := service.create("https://example.com")
+	got, err := service.create(context.Background(), "https://example.com")
 
 	if !errors.Is(err, repositoryErr) {
 		t.Fatalf("error = %v, want wrapped repository error", err)
@@ -185,7 +186,7 @@ func TestURLServiceCreateRetriesCollision(t *testing.T) {
 		OriginalURL: "https://example.com/original",
 	}
 
-	if err := repository.save(original); err != nil {
+	if err := repository.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
 	}
 
@@ -206,7 +207,7 @@ func TestURLServiceCreateRetriesCollision(t *testing.T) {
 		OriginalURL: "https://example.com/new",
 	}
 
-	got, err := service.create(want.OriginalURL)
+	got, err := service.create(context.Background(), want.OriginalURL)
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -219,20 +220,25 @@ func TestURLServiceCreateRetriesCollision(t *testing.T) {
 		t.Errorf("generator calls = %d, want 2", generatorCalls)
 	}
 
-	savedOriginal, exists := repository.get(original.Code)
-	if !exists || savedOriginal != original {
-		t.Errorf(
-			"original record = (%+v, %t), want (%+v, true)",
-			savedOriginal, exists, original,
-		)
+	savedOriginal, lookupErr := repository.get(
+		context.Background(),
+		original.Code,
+	)
+	if lookupErr != nil {
+		t.Fatalf("get original record: %v", lookupErr)
 	}
 
-	savedNew, exists := repository.get(want.Code)
-	if !exists || savedNew != want {
-		t.Errorf(
-			"new record = (%+v, %t), want (%+v, true)",
-			savedNew, exists, want,
-		)
+	if savedOriginal != original {
+		t.Errorf("original record = %+v, want %+v", savedOriginal, original)
+	}
+
+	savedNew, lookupErr := repository.get(context.Background(), want.Code)
+	if lookupErr != nil {
+		t.Fatalf("get new record: %v", lookupErr)
+	}
+
+	if savedNew != want {
+		t.Errorf("new record = %+v, want %+v", savedNew, want)
 	}
 }
 
@@ -243,7 +249,7 @@ func TestURLServiceCreateCollisionLimit(t *testing.T) {
 		OriginalURL: "https://example.com/original",
 	}
 
-	if err := repository.save(original); err != nil {
+	if err := repository.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
 	}
 
@@ -256,7 +262,7 @@ func TestURLServiceCreateCollisionLimit(t *testing.T) {
 		},
 	}
 
-	got, err := service.create("https://example.com/new")
+	got, err := service.create(context.Background(), "https://example.com/new")
 
 	if !errors.Is(err, errCodeAllocationExhausted) {
 		t.Fatalf("error = %v, want errCodeAllocationExhausted", err)
@@ -270,12 +276,13 @@ func TestURLServiceCreateCollisionLimit(t *testing.T) {
 		t.Errorf("generator calls = %d, want 5", generatorCalls)
 	}
 
-	saved, exists := repository.get(original.Code)
-	if !exists || saved != original {
-		t.Errorf(
-			"original record = (%+v, %t), want (%+v, true)",
-			saved, exists, original,
-		)
+	saved, lookupErr := repository.get(context.Background(), original.Code)
+	if lookupErr != nil {
+		t.Fatalf("get original after retry exhaustion: %v", lookupErr)
+	}
+
+	if saved != original {
+		t.Errorf("original record = %+v, want %+v", saved, original)
 	}
 
 	repository.mu.RLock()

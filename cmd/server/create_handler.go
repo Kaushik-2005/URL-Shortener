@@ -28,7 +28,7 @@ func newCreateURLHandler(
 			return
 		}
 
-		record, err := service.create(request.URL)
+		record, err := service.create(r.Context(), request.URL)
 		if err != nil {
 			writeServiceError(w, err)
 			return
