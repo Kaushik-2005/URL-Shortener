@@ -12,5 +12,14 @@ type urlRepository interface {
 	get(ctx context.Context, code string) (urlRecord, error)
 }
 
-var _ urlRepository = (*memoryStore)(nil)
-var _ urlRepository = (*postgresStore)(nil)
+type urlDeleter interface {
+	delete(ctx context.Context, code string) error
+}
+
+type urlStore interface {
+	urlRepository
+	urlDeleter
+}
+
+var _ urlStore = (*memoryStore)(nil)
+var _ urlStore = (*postgresStore)(nil)

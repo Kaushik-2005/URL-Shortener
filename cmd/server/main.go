@@ -13,7 +13,7 @@ import (
 
 func main() {
 	mux := http.NewServeMux()
-	var store urlRepository
+	var store urlStore
 
 	switch backend := os.Getenv("STORAGE_BACKEND"); backend {
 	case "", "memory":
@@ -35,6 +35,22 @@ func main() {
 
 	default:
 		log.Fatalf("Unknown STORAGE_BACKEND: %q", backend)
+	}
+
+	managementKey := os.Getenv("MANAGEMENT_API_KEY")
+	if managementKey != "" {
+		deleteHandler, err := requireAPIKey(
+			managementKey,
+			newDeleteURLHandler(store),
+		)
+		if err != nil {
+			log.Fatalf("Configure management authentication: %v", err)
+		}
+
+		mux.Handle(
+			"DELETE /api/v1/urls/{code}",
+			deleteHandler,
+		)
 	}
 
 	baseURL := "http://127.0.0.1:8080"

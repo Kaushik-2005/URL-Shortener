@@ -19,8 +19,8 @@ func (s *postgresStore) save(
 	record urlRecord,
 ) error {
 	const query = `
-		INSERT INTO public.urls (code, original_url)
-		VALUES ($1, $2)
+		INSERT INTO public.urls (code, original_url, expires_at)
+		VALUES ($1, $2, $3)
 	`
 
 	_, err := s.pool.Exec(
@@ -28,6 +28,7 @@ func (s *postgresStore) save(
 		query,
 		record.Code,
 		record.OriginalURL,
+		record.ExpiresAt,
 	)
 	if err != nil {
 		var postgresErr *pgconn.PgError
@@ -48,7 +49,7 @@ func (s *postgresStore) get(
 	code string,
 ) (urlRecord, error) {
 	const query = `
-		SELECT code, original_url
+		SELECT code, original_url, expires_at
 		FROM public.urls
 		WHERE code = $1
 	`
@@ -57,6 +58,7 @@ func (s *postgresStore) get(
 	err := s.pool.QueryRow(ctx, query, code).Scan(
 		&record.Code,
 		&record.OriginalURL,
+		&record.ExpiresAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return urlRecord{}, errURLNotFound
@@ -66,4 +68,25 @@ func (s *postgresStore) get(
 	}
 
 	return record, nil
+}
+
+func (s *postgresStore) delete(
+	ctx context.Context,
+	code string,
+) error {
+	const query = `
+		DELETE FROM public.urls
+		WHERE code = $1
+	`
+
+	result, err := s.pool.Exec(ctx, query, code)
+	if err != nil {
+		return fmt.Errorf("delete URL: %w", err)
+	}
+
+	if result.RowsAffected() == 0 {
+		return errURLNotFound
+	}
+
+	return nil
 }

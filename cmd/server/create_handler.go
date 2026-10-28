@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/http"
+	"time"
 )
 
 func newCreateURLHandler(
@@ -28,20 +29,38 @@ func newCreateURLHandler(
 			return
 		}
 
-		record, err := service.create(r.Context(), request.URL)
+		var record urlRecord
+
+		if request.Alias == nil {
+			record, err = service.create(
+				r.Context(),
+				request.URL,
+				request.ExpiresAt,
+			)
+		} else {
+			record, err = service.createWithAlias(
+				r.Context(),
+				request.URL,
+				*request.Alias,
+				request.ExpiresAt,
+			)
+		}
+
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
 
 		response := struct {
-			Code     string `json:"code"`
-			URL      string `json:"url"`
-			ShortURL string `json:"short_url"`
+			Code      string     `json:"code"`
+			URL       string     `json:"url"`
+			ShortURL  string     `json:"short_url"`
+			ExpiresAt *time.Time `json:"expires_at,omitempty"`
 		}{
-			Code:     record.Code,
-			URL:      record.OriginalURL,
-			ShortURL: baseURL + "/" + record.Code,
+			Code:      record.Code,
+			URL:       record.OriginalURL,
+			ShortURL:  baseURL + "/" + record.Code,
+			ExpiresAt: record.ExpiresAt,
 		}
 
 		writeJSON(w, http.StatusCreated, response)

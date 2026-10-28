@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 )
 
 type createURLRequest struct {
-	URL string `json:"url"`
+	URL       string     `json:"url"`
+	Alias     *string    `json:"alias"`
+	ExpiresAt *time.Time `json:"expires_at"`
 }
 
 func decodeCreateRequest(

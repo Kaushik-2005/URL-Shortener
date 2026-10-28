@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"time"
 )
 
 func newMetadataHandler(store urlRepository) http.HandlerFunc {
@@ -14,12 +15,19 @@ func newMetadataHandler(store urlRepository) http.HandlerFunc {
 			return
 		}
 
+		if record.isExpired(time.Now()) {
+			writeServiceError(w, errURLExpired)
+			return
+		}
+
 		response := struct {
-			Code string `json:"code"`
-			URL  string `json:"url"`
+			Code      string     `json:"code"`
+			URL       string     `json:"url"`
+			ExpiresAt *time.Time `json:"expires_at,omitempty"`
 		}{
-			Code: record.Code,
-			URL:  record.OriginalURL,
+			Code:      record.Code,
+			URL:       record.OriginalURL,
+			ExpiresAt: record.ExpiresAt,
 		}
 
 		writeJSON(w, http.StatusOK, response)

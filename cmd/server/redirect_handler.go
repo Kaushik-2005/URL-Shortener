@@ -1,6 +1,9 @@
 package main
 
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 func newRedirectHandler(store urlRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -9,6 +12,11 @@ func newRedirectHandler(store urlRepository) http.HandlerFunc {
 		record, err := store.get(r.Context(), code)
 		if err != nil {
 			writeServiceError(w, err)
+			return
+		}
+
+		if record.isExpired(time.Now()) {
+			writeServiceError(w, errURLExpired)
 			return
 		}
 

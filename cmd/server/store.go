@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 var errCodeExists = errors.New("Short code already exists")
@@ -11,6 +12,7 @@ var errCodeExists = errors.New("Short code already exists")
 type urlRecord struct {
 	Code        string
 	OriginalURL string
+	ExpiresAt   *time.Time
 }
 
 type memoryStore struct {
@@ -57,4 +59,23 @@ func (s *memoryStore) get(
 	}
 
 	return record, nil
+}
+
+func (s *memoryStore) delete(
+	ctx context.Context,
+	code string,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if _, exists := s.urls[code]; !exists {
+		return errURLNotFound
+	}
+
+	delete(s.urls, code)
+	return nil
 }

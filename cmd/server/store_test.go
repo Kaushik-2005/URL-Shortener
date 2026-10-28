@@ -119,3 +119,67 @@ func TestMemoryStoreConcurrentAccess(t *testing.T) {
 		t.Errorf("successful saves = %d, want 1", successes)
 	}
 }
+
+func TestMemoryStoreDelete(t *testing.T) {
+	store := newMemoryStore()
+	ctx := context.Background()
+
+	target := urlRecord{
+		Code:        "delete-me",
+		OriginalURL: "https://example.com/target",
+	}
+	other := urlRecord{
+		Code:        "keep-me",
+		OriginalURL: "https://example.com/other",
+	}
+
+	if err := store.save(ctx, target); err != nil {
+		t.Fatalf("save target: %v", err)
+	}
+	if err := store.save(ctx, other); err != nil {
+		t.Fatalf("save other: %v", err)
+	}
+
+	if err := store.delete(ctx, target.Code); err != nil {
+		t.Fatalf("delete target: %v", err)
+	}
+
+	got, err := store.get(ctx, target.Code)
+	if !errors.Is(err, errURLNotFound) {
+		t.Fatalf("get deleted record error = %v, want errURLNotFound", err)
+	}
+	if got != (urlRecord{}) {
+		t.Errorf("deleted record = %+v, want empty record", got)
+	}
+
+	if err := store.delete(ctx, target.Code); !errors.Is(err, errURLNotFound) {
+		t.Errorf("second delete error = %v, want errURLNotFound", err)
+	}
+
+	savedOther, err := store.get(ctx, other.Code)
+	if err != nil {
+		t.Fatalf("get other record: %v", err)
+	}
+	if savedOther != other {
+		t.Errorf("other record = %+v, want %+v", savedOther, other)
+	}
+
+	replacement := urlRecord{
+		Code:        target.Code,
+		OriginalURL: "https://example.com/replacement",
+	}
+	if err := store.save(ctx, replacement); err != nil {
+		t.Fatalf("reuse deleted code: %v", err)
+	}
+
+	savedReplacement, err := store.get(ctx, replacement.Code)
+	if err != nil {
+		t.Fatalf("get replacement: %v", err)
+	}
+	if savedReplacement != replacement {
+		t.Errorf(
+			"replacement = %+v, want %+v",
+			savedReplacement, replacement,
+		)
+	}
+}

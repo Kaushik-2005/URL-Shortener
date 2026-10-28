@@ -2,9 +2,9 @@
 
 A learning project built by hand with Go and the standard-library `net/http` package. Follow [roadmap.md](roadmap.md) for the planned modules and [AGENTS.md](AGENTS.md) for the mentoring workflow.
 
-The current implementation creates short links, redirects them, and returns their metadata using either concurrency-safe in-memory storage or PostgreSQL. It also provides a health endpoint and graceful shutdown. PostgreSQL records survive Go server restarts; memory records do not.
+The current implementation creates short links with optional custom aliases and expiry, redirects active links, returns metadata, and supports API-key-protected deletion. Storage can be concurrency-safe memory or PostgreSQL. It also provides a health endpoint and graceful shutdown. PostgreSQL records survive Go server restarts; memory records do not.
 
-Implementation and verification cover Modules 0 through 3: HTTP foundations, the in-memory MVP, service and repository boundaries, and PostgreSQL persistence. URL lifecycle behavior is the next roadmap module.
+Implementation and verification cover Modules 0 through 4: HTTP foundations, the in-memory MVP, service and repository boundaries, PostgreSQL persistence, and URL lifecycle behavior. The optional update endpoint is deferred. Redis caching is the next roadmap module.
 
 ## Requirements
 
@@ -27,6 +27,7 @@ The server listens on `http://127.0.0.1:8080` and is accessible from the local c
 | `STORAGE_BACKEND` | Empty or `memory` selects memory storage; `postgres` selects PostgreSQL. Other values fail startup. |
 | `DATABASE_URL` | Required for PostgreSQL server mode. Ignored in memory mode. |
 | `TEST_DATABASE_URL` | Enables real PostgreSQL integration tests. Separate from application configuration. |
+| `MANAGEMENT_API_KEY` | Enables the protected DELETE route when nonempty. Unset or empty leaves deletion disabled; whitespace-only configuration fails startup. |
 
 These are process environment variables; the application does not automatically load a `.env` file.
 
@@ -120,7 +121,7 @@ At the `psql` prompt:
 SELECT version, dirty FROM schema_migrations;
 ```
 
-The `urls` table has an identity primary key, a unique `code`, nonempty checks for the code and original URL, a default creation timestamp, and a nullable expiry timestamp. Both timestamps use `TIMESTAMPTZ` (`timestamp with time zone`). Session timezone controls display; the values represent instants. A null expiry means no expiration. Expiry behavior is not implemented yet.
+The `urls` table has an identity primary key, a unique `code`, nonempty checks for the code and original URL, a default creation timestamp, and a nullable expiry timestamp. Both timestamps use `TIMESTAMPTZ` (`timestamp with time zone`). Session timezone controls display; the values represent instants. A null expiry means no expiration. Lifecycle support uses this existing column, so it requires no additional migration.
 
 `001_create_urls.down.sql` drops the table and its data. Reapplying the up migration recreates the structure, not the deleted records. A dirty migration requires inspecting the actual schema before repairing tracking: `force` changes version metadata without running SQL. In this runner, no applied migration is represented by `-1`, not `0`; passing a negative force argument requires `force -- -1`. That is a recovery mechanism, not part of normal setup.
 
@@ -140,13 +141,14 @@ Startup creates a shared pgx pool and checks connectivity with a five-second con
 
 | Method | Path | Successful response |
 | --- | --- | --- |
-| POST | `/api/v1/urls` | 201 with `code`, `url`, and `short_url` as JSON |
-| GET | `/api/v1/urls/{code}` | 200 with `code` and `url` as JSON |
+| POST | `/api/v1/urls` | 201 with `code`, `url`, `short_url`, and optional `expires_at` as JSON |
+| GET | `/api/v1/urls/{code}` | 200 with `code`, `url`, and optional `expires_at` as JSON for an active link |
 | GET | `/{code}` | 302 with the destination in the `Location` header |
+| DELETE | `/api/v1/urls/{code}` | 204 with no body; requires configured management authentication |
 | GET | `/healthz` | 200 with `OK` |
 | GET | `/` | 200 with `Hello, Go!` |
 
-Unknown codes return 404. Successful API responses use `Content-Type: application/json`; error responses are plain text. Go's GET route patterns also accept HEAD requests.
+Unknown codes return 404. Expired metadata and redirect requests return 410 without a redirect destination. Successful create and metadata responses use `Content-Type: application/json`; error responses are plain text. Successful deletion has no body. Go's GET route patterns also accept HEAD requests.
 
 `ServeMux` selects the most specific matching pattern. The literal health route takes precedence over `/{code}`, which captures one path segment. The root route uses `GET /{$}` to match only `/`.
 
@@ -194,20 +196,133 @@ curl.exe -i http://127.0.0.1:8080/
 
 Expect 404, 404, 200 with `OK`, and 200 with the greeting, respectively. In memory mode, create a fresh link after restarting. In PostgreSQL mode, existing links remain available when the server reconnects to the same database.
 
+## Custom aliases and expiry
+
+Creation accepts optional `alias` and `expires_at` fields alongside the required destination URL:
+
+| Field | Omitted or null | Supplied value |
+| --- | --- | --- |
+| `alias` | Generate a random code | Use the exact validated alias; an empty string is invalid |
+| `expires_at` | No expiry | RFC 3339 timestamp with timezone, such as `2030-01-01T12:00:00Z` |
+
+Aliases must contain 3–32 ASCII letters, digits, hyphens, or underscores. They preserve capitalization and are case-sensitive under the tested storage setup. `healthz` and `api` are reserved regardless of capitalization. Whitespace is not trimmed. Custom aliases and generated codes share one uniqueness namespace.
+
+An occupied alias returns 409 without overwriting the existing mapping or falling back to a random code. Alias creation makes one save attempt; random allocation retains its five-attempt collision limit.
+
+Expiry is an absolute deadline, not a TTL duration. Both creation paths normalize a copy of the supplied timestamp to UTC and truncate it to microsecond precision, then require it to be strictly in the future. Malformed timestamps fail decoding; correctly formatted past deadlines fail service validation. Both produce 400. The normalized expiry is returned in create and active-metadata responses. When no expiry is configured, `expires_at` is omitted rather than returned as null.
+
+A link is expired when the current time is at or after its deadline. Both metadata and redirects return 410 for expired links. Expiry does not delete a record or release its code; an expired alias still conflicts with a new creation request.
+
+### Try the lifecycle over HTTP
+
+With the server running, create a uniquely named alias that expires in two minutes:
+
+```powershell
+$deadline = [DateTimeOffset]::UtcNow.AddMinutes(2)
+$payload = @{
+    url = 'https://example.com/expiry-demo'
+    alias = "expiry-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+    expires_at = $deadline.ToString('o')
+} | ConvertTo-Json -Compress
+
+$response = Invoke-WebRequest -Uri 'http://127.0.0.1:8080/api/v1/urls' -Method Post -ContentType 'application/json' -Body $payload
+$lifecycleLink = $response.Content | ConvertFrom-Json
+$lifecycleURL = "http://127.0.0.1:8080/api/v1/urls/$($lifecycleLink.code)"
+$response.StatusCode
+$response.Content
+```
+
+Expect 201 with the alias and normalized expiry. Before the deadline:
+
+```powershell
+curl.exe -i $lifecycleURL
+curl.exe -i $lifecycleLink.short_url
+```
+
+Expect 200 with metadata and 302 with the destination. After the returned expiry passes, repeat the same requests; both should return 410.
+
+Attempt alias reuse without an expiry:
+
+```powershell
+$reusePayload = @{
+    url = 'https://example.com/replacement'
+    alias = $lifecycleLink.code
+} | ConvertTo-Json -Compress
+
+$reusePayload | curl.exe -i -H 'Content-Type: application/json' --data-binary '@-' http://127.0.0.1:8080/api/v1/urls
+```
+
+Expect 409. Resending the original payload after its deadline would instead return 400 because expiry validation runs before saving and detecting an alias conflict.
+
+## Protected deletion
+
+Deletion permanently removes an active or expired mapping and releases its code for reuse. Successful deletion returns 204 with an empty body. A missing code, including a repeated deletion, returns 404. Metadata and redirect requests return 404 after deletion.
+
+The DELETE route is registered only when `MANAGEMENT_API_KEY` is nonempty at startup. Without configuration, DELETE on the metadata path returns 405 from the router. With configuration, missing or invalid credentials return 401 with `WWW-Authenticate: Bearer`, without reaching deletion.
+
+This is one shared management key, not per-user ownership: anyone holding it can delete any link. Create, metadata, redirect, and health endpoints remain public. The middleware compares fixed-length SHA-256 hashes with `crypto/subtle.ConstantTimeCompare`. It does not log credentials.
+
+### Enable deletion
+
+Choose and privately retain a long random management key, separate from the database password. In the server terminal, enter it at a hidden prompt before starting or restarting Go:
+
+```powershell
+$managementKeyInput = Read-Host 'Management API key' -AsSecureString
+$env:MANAGEMENT_API_KEY = [System.Net.NetworkCredential]::new('', $managementKeyInput).Password
+go run ./cmd/server
+```
+
+Keep the desired storage configuration in that same terminal. The server reads this environment variable only during startup. Do not put the key in source code, command-line literals, logs, or shared output. The current listener is local HTTP; protect bearer credentials with HTTPS before using them across a network.
+
+### Verify unauthorized and authorized deletion
+
+In a second terminal, create a disposable link:
+
+```powershell
+$response = Invoke-WebRequest -Uri 'http://127.0.0.1:8080/api/v1/urls' -Method Post -ContentType 'application/json' -Body '{"url":"https://example.com/delete-check"}'
+$deleteLink = $response.Content | ConvertFrom-Json
+$deleteURL = "http://127.0.0.1:8080/api/v1/urls/$($deleteLink.code)"
+
+curl.exe -i -X DELETE $deleteURL
+curl.exe -i $deleteURL
+```
+
+Expect 401 followed by 200, proving the unauthorized request preserved the record. Enter the same key used by the server:
+
+```powershell
+$clientKeyInput = Read-Host 'Management API key' -AsSecureString
+$clientKey = [System.Net.NetworkCredential]::new('', $clientKeyInput).Password
+$managementHeaders = @{ Authorization = "Bearer $clientKey" }
+
+$result = Invoke-WebRequest -Uri $deleteURL -Method Delete -Headers $managementHeaders
+$result.StatusCode
+$result.Content
+
+curl.exe -i $deleteURL
+curl.exe -i $deleteLink.short_url
+```
+
+Expect 204 with an empty body, then 404 from both lookups. The client and server terminals have separate variables; setting a client key does not configure the already-running server. Share status codes rather than credentials when debugging.
+
 ## Input rules and failure responses
 
-Creation accepts one JSON object with a string field named `url`:
+Creation accepts one JSON object with a string field named `url` and optional `alias` and `expires_at` fields:
 
 - The entire body is limited to 4 KiB (4096 bytes), including trailing whitespace.
 - Malformed JSON, unknown fields, incorrect field types, and additional JSON values are rejected.
 - The URL must parse successfully, use `http` or `https`, and contain a nonempty hostname.
 - Empty or missing URLs, relative paths, and unsupported schemes are rejected.
 - Validation checks URL structure without contacting the destination; it does not establish destination availability or safety.
+- Supplied alias and expiry values must meet the lifecycle rules above; invalid input is rejected before saving.
 
 | Status | Meaning |
 | --- | --- |
-| 400 | Invalid JSON body or rejected URL |
+| 400 | Invalid JSON body, destination URL, alias, or expiry |
+| 401 | Missing or invalid credentials for configured management deletion |
 | 404 | Unknown short code |
+| 405 | Method not registered, including DELETE when management deletion is disabled |
+| 409 | Requested custom alias is already occupied |
+| 410 | Existing link has expired; applies to metadata and redirect access |
 | 413 | Request body exceeds the size limit |
 | 500 | Code generation, database access, or another unexpected internal operation fails |
 | 503 | All five code-allocation attempts encounter collisions |
@@ -218,7 +333,9 @@ The decoder does not currently enforce the request's `Content-Type`; clients sho
 
 One repository is selected at startup and shared by all handlers. Memory mode uses a map protected by `sync.RWMutex`. Duplicate-code detection and insertion share a write lock, so an existing mapping cannot be overwritten by a competing create operation.
 
-PostgreSQL mode uses a shared `pgxpool.Pool`. Inserts and lookups use parameterized SQL. The database's `urls_code_unique` constraint enforces code uniqueness across requests and server processes. The repository translates SQLSTATE `23505` for that specific constraint into `errCodeExists`; it translates `pgx.ErrNoRows` into `errURLNotFound`. Other database errors are wrapped and returned rather than misreported as missing records.
+PostgreSQL mode uses a shared `pgxpool.Pool`. Inserts, lookups, and deletions use parameterized SQL. The database's `urls_code_unique` constraint enforces code uniqueness across requests and server processes. The repository translates SQLSTATE `23505` for that specific constraint into `errCodeExists`; it translates `pgx.ErrNoRows` into `errURLNotFound`. Deletion checks `RowsAffected()` because a DELETE matching no rows succeeds at the SQL level but should report a missing record to the application. Other database errors are wrapped and returned rather than misreported as missing records.
+
+Optional expiry is stored as nullable `expires_at`. Repository lookup returns expired records as data; the metadata and redirect handlers enforce the 410 access policy. Deletion can remove those records explicitly.
 
 Codes use six random bytes from `crypto/rand`, encoded as eight URL-safe Base64 characters without padding. Randomness does not guarantee uniqueness. Creation retries with a new code after a collision, up to five attempts total.
 
@@ -233,14 +350,18 @@ The code remains in the `cmd/server` package. Responsibilities are separated int
 | File | Responsibility |
 | --- | --- |
 | `main.go` | Select storage from environment configuration, register routes, and manage server startup and shutdown |
-| `repository.go` | Define the context-aware `urlRepository` interface and check that both stores satisfy it |
+| `repository.go` | Define `urlRepository`, narrow `urlDeleter`, and composed `urlStore`; check both implementations |
 | `store.go` | Define URL records and implement concurrency-safe in-memory storage |
 | `database.go` | Create a pgx pool and verify connectivity with a bounded ping |
-| `postgres_store.go` | Implement PostgreSQL inserts and lookups with parameterized SQL and error translation |
-| `service.go` | Validate destinations, generate codes, retry collisions, and save records |
+| `postgres_store.go` | Implement PostgreSQL saves, lookups, expiry persistence, and deletion with error translation |
+| `service.go` | Validate destinations, aliases, and expiry; allocate random or custom codes and save records |
 | `create_handler.go` | Decode create requests, call the service, and build HTTP responses |
 | `metadata_handler.go` | Look up records and return metadata as JSON |
 | `redirect_handler.go` | Look up records and return redirects |
+| `delete_handler.go` | Delete a record through `urlDeleter` and return 204 or a mapped error |
+| `auth.go` | Validate management credentials before calling the protected handler |
+| `alias.go` | Enforce custom-alias characters, length, and reserved names |
+| `expiry.go` | Normalize and validate deadlines and check exact expiry boundaries |
 | `request.go` | Decode one JSON request with a body-size limit and unknown-field rejection |
 | `response.go` | Write JSON responses and map service errors to HTTP errors |
 | `validation.go` | Enforce the destination URL policy |
@@ -259,13 +380,16 @@ Service result or error -> HTTP handler -> response helper -> HTTP response
 
 Handlers depend on `urlRepository`, rather than the map implementation. Go checks interface satisfaction implicitly from matching method signatures. Tests can therefore substitute a fake repository to exercise storage failures.
 
-Both repository methods accept `context.Context`. The create handler passes `r.Context()` through the service to saving; metadata and redirect handlers pass it to lookup. Lookup returns `(urlRecord, error)`, distinguishing missing records from cancellation and storage failures. The connection helper's temporary context is canceled after setup; later queries use their caller's context.
+All storage operations accept `context.Context`. The create handler passes `r.Context()` through the service to saving; metadata and redirect handlers pass it to lookup, and deletion passes it to removal. Lookup returns `(urlRecord, error)`, distinguishing missing records from cancellation and storage failures. The delete handler depends only on `urlDeleter`; startup selects the composed `urlStore`. The connection helper's temporary context is canceled after setup; later queries use their caller's context.
 
 The service has no dependency on HTTP. It returns records or errors, preserving unexpected generator and repository errors with `%w`. The response helper recognizes wrapped application errors with `errors.Is`:
 
 - `errInvalidURL` maps to 400.
+- `errInvalidAlias` and `errInvalidExpiry` map to 400.
+- `errAliasTaken` maps to 409.
 - `errCodeAllocationExhausted` maps to 503.
 - `errURLNotFound` maps to 404.
+- `errURLExpired` maps to 410.
 - Unexpected service failures are logged internally and map to a generic 500 response.
 
 Request-decoding errors remain in the create handler: oversized bodies map to 413 and other decoding failures to 400. Redirect and metadata handlers currently read from the repository directly.
@@ -296,6 +420,8 @@ If that connection variable is not populated in this terminal, repeat the passwo
 - `TestOpenPostgresIntegration`
 - `TestPostgresStoreSaveLookupAndCollisionIntegration`
 - `TestPostgresStoreConcurrentInsertIntegration`
+- `TestPostgresStoreExpiryRoundTripIntegration`
+- `TestPostgresStoreDeleteIntegration`
 
 The connection test runs `SELECT 1`. Repository tests insert uniquely named test records and delete them during cleanup; they do not clear the table. The concurrent test expects one successful insert and fifteen collisions for a shared code. Cleanup uses a fresh timeout context and runs before pool closure. `-count=1` requests a fresh run rather than a cached result.
 
@@ -311,8 +437,16 @@ Automated tests cover:
 - Metadata responses and redirects for known and missing codes.
 - PostgreSQL connectivity, save/lookup, missing-record translation, duplicate-code preservation, and concurrent uniqueness enforcement.
 - Metadata and redirect handlers returning generic 500 responses without a redirect destination when repository lookup fails.
+- Alias length boundaries, characters, reserved names, capitalization preservation, conflicts, and no random fallback.
+- Optional alias/expiry decoding, including omitted versus explicit empty values, timestamp offsets, and invalid types.
+- Expiry normalization, caller-input preservation, past-deadline rejection, and before/at/after deadline boundaries.
+- Expiry returned and stored through both creation paths, PostgreSQL timestamp round trips, active metadata fields, and omission for permanent links.
+- Metadata and redirects returning 410 for expired links while retaining records.
+- Memory and PostgreSQL deletion, missing records, preservation of unrelated records, and reuse of deleted codes.
+- Delete-handler success, expiry-independent deletion, empty 204 bodies, and storage failures.
+- Authentication rejection, empty-key configuration, handler execution control, and actual record preservation during unauthorized deletion.
 
-The developer reports that these tests pass with the race detector enabled and that vet reports no issues. Manual HTTP checks have verified creation, metadata lookup, redirects, missing records, and the basic endpoints. Handler tests call handlers directly; they do not automatically verify route registration. Passing race checks cover the executions tested, rather than proving every possible concurrent execution correct.
+The developer reports that these tests pass with the race detector enabled and that vet reports no issues, including runs with real PostgreSQL integration tests enabled. Manual HTTP checks have verified creation, alias conflicts, metadata, redirects, expiry transitions, unauthorized deletion preservation, authorized deletion, and the basic endpoints. Handler tests call handlers directly; they do not automatically verify route registration. Passing race checks cover the executions tested, rather than proving every possible concurrent execution correct.
 
 ### Coverage
 
@@ -333,9 +467,10 @@ Startup and shutdown remain outside the automated suite, and error branches in t
 
 - Memory storage has no capacity limit and is cleared on process exit. Persistence requires selecting the PostgreSQL backend.
 - The listen address and public short-link base URL are fixed in application setup.
-- Authentication, rate limiting, expiry, custom aliases, Redis caching, and analytics are not implemented yet.
-- Metadata currently contains only the short code and original URL.
-- The database stores an ID and timestamps, but the current Go record and API expose only the code and original URL. Application-created rows leave expiry null.
+- Rate limiting, Redis caching, analytics, and the optional update endpoint are not implemented yet.
+- Authentication is one shared management key protecting deletion; there is no per-user ownership or credential rotation mechanism.
+- The database stores an ID and creation timestamp, but metadata currently exposes only the code, original URL, and optional expiry.
+- Expired records are retained without automatic cleanup. Their codes remain reserved until explicit deletion, which releases the code for reuse.
 - `/healthz` does not test database readiness. Unexpected database failures currently map to 500 rather than a separately classified availability response.
 - Request contexts propagate cancellation, but database operations do not yet receive an additional application-defined query deadline.
 

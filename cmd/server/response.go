@@ -32,6 +32,18 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		)
 	case errors.Is(err, errURLNotFound):
 		http.Error(w, "404 page not found", http.StatusNotFound)
+	case errors.Is(err, errInvalidAlias):
+		http.Error(
+			w,
+			"alias must be 3-32 ASCII letters, digits, hyphens, or underscores and must not be reserved",
+			http.StatusBadRequest,
+		)
+	case errors.Is(err, errAliasTaken):
+		http.Error(w, "alias already exists", http.StatusConflict)
+	case errors.Is(err, errInvalidExpiry):
+		http.Error(w, "expiry must be in the future", http.StatusBadRequest)
+	case errors.Is(err, errURLExpired):
+		http.Error(w, "URL has expired", http.StatusGone)
 	default:
 		log.Printf("Service error: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)
