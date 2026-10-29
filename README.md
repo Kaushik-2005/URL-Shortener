@@ -2,14 +2,15 @@
 
 A learning project built by hand with Go and the standard-library `net/http` package. Follow [roadmap.md](roadmap.md) for the planned modules and [AGENTS.md](AGENTS.md) for the mentoring workflow.
 
-The current implementation creates short links with optional custom aliases and expiry, redirects active links, returns metadata, and supports API-key-protected deletion. Storage can be concurrency-safe memory or PostgreSQL. It also provides a health endpoint and graceful shutdown. PostgreSQL records survive Go server restarts; memory records do not.
+The current implementation creates short links with optional custom aliases and expiry, redirects active links, returns metadata, and supports API-key-protected deletion. Storage can be concurrency-safe memory or PostgreSQL, with optional Redis cache-aside lookup in PostgreSQL mode. It also provides a health endpoint and graceful shutdown. PostgreSQL records survive Go server restarts; memory records do not.
 
-Implementation and verification cover Modules 0 through 4: HTTP foundations, the in-memory MVP, service and repository boundaries, PostgreSQL persistence, and URL lifecycle behavior. The optional update endpoint is deferred. Redis caching is the next roadmap module.
+Implementation and functional verification cover Modules 0 through 5: HTTP foundations, the in-memory MVP, service and repository boundaries, PostgreSQL persistence, URL lifecycle behavior, and Redis caching. The optional update endpoint is deferred. Security and operational safeguards are the next roadmap module. Caching behavior has been verified; a performance improvement has not yet been measured.
 
 ## Requirements
 
 - Go 1.26.6 or newer, as specified in `go.mod`.
 - For PostgreSQL storage: a running PostgreSQL server, `psql`, and the `golang-migrate` CLI. The local setup was verified with PostgreSQL 18.6, pgx v5.11.0, and migrate v4.20.1.
+- For caching: Redis, tested locally through the `redis:8` Docker image with go-redis v9.23.0. On Windows, Docker Desktop must be running its Linux-container engine.
 
 ## Run
 
@@ -17,6 +18,7 @@ From the project root, start with in-memory storage:
 
 ```powershell
 $env:STORAGE_BACKEND = 'memory'
+$env:REDIS_URL = ''
 go run ./cmd/server
 ```
 
@@ -27,6 +29,8 @@ The server listens on `http://127.0.0.1:8080` and is accessible from the local c
 | `STORAGE_BACKEND` | Empty or `memory` selects memory storage; `postgres` selects PostgreSQL. Other values fail startup. |
 | `DATABASE_URL` | Required for PostgreSQL server mode. Ignored in memory mode. |
 | `TEST_DATABASE_URL` | Enables real PostgreSQL integration tests. Separate from application configuration. |
+| `REDIS_URL` | Nonempty enables Redis caching and requires `STORAGE_BACKEND=postgres`; unset or empty disables caching. |
+| `TEST_REDIS_URL` | Enables Redis client and adapter integration tests independently of server configuration. |
 | `MANAGEMENT_API_KEY` | Enables the protected DELETE route when nonempty. Unset or empty leaves deletion disabled; whitespace-only configuration fails startup. |
 
 These are process environment variables; the application does not automatically load a `.env` file.
@@ -137,6 +141,89 @@ go run ./cmd/server
 
 Startup creates a shared pgx pool and checks connectivity with a five-second context. Startup fails if configuration or connectivity fails; it does not silently fall back to memory storage. On normal shutdown, the pool closes after the HTTP server finishes shutting down.
 
+## Redis caching setup
+
+### Start local Redis
+
+Open Docker Desktop and wait for its engine to start. In PowerShell:
+
+```powershell
+docker info --format '{{.OSType}}'
+```
+
+Expect `linux`. For first-time setup, create the container:
+
+```powershell
+docker run --detach --name url-shortener-redis --publish 127.0.0.1:6379:6379 redis:8
+```
+
+For an already-created container, use this instead of repeating `docker run`:
+
+```powershell
+docker start url-shortener-redis
+```
+
+Check Redis with the client included inside the container:
+
+```powershell
+docker exec url-shortener-redis redis-cli ping
+```
+
+Expect `PONG`. The port mapping exposes Redis only on the Windows loopback address. A separate Windows `redis-cli` installation is not needed. This container ping checks Redis internally; the Go integration test below checks access through the published host port.
+
+### Enable caching in the Go server
+
+In the same terminal containing the PostgreSQL connection setup:
+
+```powershell
+$env:STORAGE_BACKEND = 'postgres'
+$env:DATABASE_URL = $localDatabaseURL
+$env:REDIS_URL = 'redis://127.0.0.1:6379/0'
+go run ./cmd/server
+```
+
+Configure `MANAGEMENT_API_KEY` in that terminal before starting if you also want protected deletion. Expect `Redis lookup caching configured` followed by the normal server-start log. Restart Go after changing environment configuration.
+
+The Redis client is constructed without a startup PING, so the configuration message does not establish connectivity. Invalid URL configuration fails startup; a temporarily unavailable Redis server is handled by request-time fallback. Set `REDIS_URL` to an empty string and restart to disable caching. Setting a Redis URL in memory mode fails startup.
+
+### Cache policy
+
+PostgreSQL remains the source of truth. Creation saves directly to PostgreSQL without reading or populating Redis. Metadata and redirect lookup use this flow:
+
+```text
+Redis hit -> return cached record
+Redis miss, read error, or invalid cached data -> query PostgreSQL
+    database error -> preserve the error; do not cache it
+    record found -> calculate TTL -> populate Redis when TTL is positive
+```
+
+Cache-population failure is logged but does not discard a successfully retrieved record. Parent-request cancellation stops processing; a timeout of the Redis child context permits PostgreSQL fallback using the still-active parent context. Missing records are not negatively cached.
+
+- The maximum cache TTL is five minutes, fixed in startup configuration.
+- An expiring link uses the smaller of that maximum and its remaining lifetime when the TTL is calculated.
+- TTLs are rounded down to milliseconds. Zero, negative, expired, and sub-millisecond results skip insertion rather than create a permanent key.
+- Cache hits do not refresh TTLs; this is fixed TTL from insertion, not sliding expiry.
+- Cached JSON includes the record's expiry. The HTTP handlers still check the actual deadline and return 410 when expired.
+- An expired primary record can be returned for HTTP classification, but is not repopulated into Redis.
+
+Each Redis operation in the wrapper receives a 200 ms context budget. The client also has one-second dial/read/write timeouts, respects context deadlines, and disables automatic command retries. Those are separate limits, not a guarantee that an entire HTTP request finishes within 200 ms. Pool waits, primary queries, and coordination locks have their own behavior.
+
+### Namespaces and deletion consistency
+
+Startup generates a fresh random namespace with `crypto/rand.Text`. Application keys have this form:
+
+```text
+url-shortener:v1:url:<run-namespace>:<code>
+```
+
+The namespace is internal and does not change short URLs. A new run starts with a cold cache and ignores prior runs' entries, including entries left while the application was used without caching. Old keys expire naturally; startup does not flush Redis. The adapter's empty namespace is used by some tests, while application startup always supplies a namespace.
+
+The wrapper holds a read lock across lookup and population. Deletion takes its write lock, invalidates Redis first, then attempts primary deletion. This coordinates fills and deletion through the same wrapper instance, preventing an in-flight lookup from repopulating a deleted mapping after invalidation.
+
+If invalidation fails, primary deletion is not attempted and the API returns 500. Reads can still fall back during that Redis outage. If invalidation succeeds but primary deletion fails, the cache remains empty and subsequent lookup discovers the actual primary state. Redis deleting an already absent key is successful.
+
+This consistency policy assumes one Go server process and mutations through its handlers. The lock is not distributed, and run namespaces do not invalidate another active process's entries. Multiple server instances or direct database edits need additional coordination before equivalent consistency can be claimed. Concurrent cache misses can also duplicate database work: request coalescing or stampede prevention is not implemented.
+
 ## Endpoints
 
 | Method | Path | Successful response |
@@ -209,7 +296,7 @@ Aliases must contain 3–32 ASCII letters, digits, hyphens, or underscores. They
 
 An occupied alias returns 409 without overwriting the existing mapping or falling back to a random code. Alias creation makes one save attempt; random allocation retains its five-attempt collision limit.
 
-Expiry is an absolute deadline, not a TTL duration. Both creation paths normalize a copy of the supplied timestamp to UTC and truncate it to microsecond precision, then require it to be strictly in the future. Malformed timestamps fail decoding; correctly formatted past deadlines fail service validation. Both produce 400. The normalized expiry is returned in create and active-metadata responses. When no expiry is configured, `expires_at` is omitted rather than returned as null.
+Expiry is an absolute deadline, not a TTL duration. Both creation paths normalize a copy of the supplied timestamp to UTC and truncate it to microsecond precision, then require it to be strictly in the future. Malformed timestamps fail decoding; correctly formatted past deadlines fail service validation. Both produce 400. Creation returns the normalized UTC deadline; active metadata returns the same instant, potentially displayed with a different offset after a PostgreSQL round trip. When no expiry is configured, `expires_at` is omitted rather than returned as null.
 
 A link is expired when the current time is at or after its deadline. Both metadata and redirects return 410 for expired links. Expiry does not delete a record or release its code; an expired alias still conflicts with a new creation request.
 
@@ -256,7 +343,7 @@ Expect 409. Resending the original payload after its deadline would instead retu
 
 ## Protected deletion
 
-Deletion permanently removes an active or expired mapping and releases its code for reuse. Successful deletion returns 204 with an empty body. A missing code, including a repeated deletion, returns 404. Metadata and redirect requests return 404 after deletion.
+Deletion permanently removes an active or expired mapping and releases its code for reuse. Successful deletion returns 204 with an empty body. A missing code, including a repeated deletion, returns 404 when required storage/cache operations succeed. Metadata and redirect requests return 404 after deletion. With caching enabled, Redis invalidation must succeed before primary deletion; an invalidation failure returns 500 without removing the primary record.
 
 The DELETE route is registered only when `MANAGEMENT_API_KEY` is nonempty at startup. Without configuration, DELETE on the metadata path returns 405 from the router. With configuration, missing or invalid credentials return 401 with `WWW-Authenticate: Bearer`, without reaching deletion.
 
@@ -324,7 +411,7 @@ Creation accepts one JSON object with a string field named `url` and optional `a
 | 409 | Requested custom alias is already occupied |
 | 410 | Existing link has expired; applies to metadata and redirect access |
 | 413 | Request body exceeds the size limit |
-| 500 | Code generation, database access, or another unexpected internal operation fails |
+| 500 | Code generation, database access, required deletion invalidation, or another unexpected internal operation fails |
 | 503 | All five code-allocation attempts encounter collisions |
 
 The decoder does not currently enforce the request's `Content-Type`; clients should send `application/json` as shown above.
@@ -354,6 +441,11 @@ The code remains in the `cmd/server` package. Responsibilities are separated int
 | `store.go` | Define URL records and implement concurrency-safe in-memory storage |
 | `database.go` | Create a pgx pool and verify connectivity with a bounded ping |
 | `postgres_store.go` | Implement PostgreSQL saves, lookups, expiry persistence, and deletion with error translation |
+| `cache.go` | Define the `urlCache` interface and cache-miss error |
+| `cache_ttl.go` | Calculate finite, expiry-aware TTLs at millisecond precision |
+| `redis_client.go` | Parse Redis connection configuration and configure network timeouts and command retries |
+| `redis_cache.go` | Encode/decode records, construct namespaced keys, and implement Redis get/set/delete |
+| `cached_store.go` | Add cache-aside lookup, primary-only saves, and coordinated invalidation/deletion |
 | `service.go` | Validate destinations, aliases, and expiry; allocate random or custom codes and save records |
 | `create_handler.go` | Decode create requests, call the service, and build HTTP responses |
 | `metadata_handler.go` | Look up records and return metadata as JSON |
@@ -394,6 +486,8 @@ The service has no dependency on HTTP. It returns records or errors, preserving 
 
 Request-decoding errors remain in the create handler: oversized bodies map to 413 and other decoding failures to 400. Redirect and metadata handlers currently read from the repository directly.
 
+When caching is enabled, startup wraps the PostgreSQL store before constructing any handlers. The wrapper satisfies the same `urlStore` interface, so handlers use it without depending on Redis-specific APIs. Cache read and population errors are logged inside the wrapper and do not become HTTP failures when primary lookup succeeds. Deletion invalidation errors are returned and use the generic 500 mapping.
+
 `writeJSON` sets the content type and commits the caller-selected status before encoding. Encoding or write failures are logged; the helper cannot replace an already committed response with a new error status.
 
 ## Development checks
@@ -425,6 +519,23 @@ If that connection variable is not populated in this terminal, repeat the passwo
 
 The connection test runs `SELECT 1`. Repository tests insert uniquely named test records and delete them during cleanup; they do not clear the table. The concurrent test expects one successful insert and fifteen collisions for a shared code. Cleanup uses a fresh timeout context and runs before pool closure. `-count=1` requests a fresh run rather than a cached result.
 
+### Redis integration tests
+
+Keep Docker Desktop and the Redis container running, then configure the test terminal:
+
+```powershell
+$env:TEST_REDIS_URL = 'redis://127.0.0.1:6379/0'
+go test -race -count=1 -v ./...
+```
+
+Keep `TEST_DATABASE_URL` populated too to exercise both external services in one run. Redis integration tests skip when `TEST_REDIS_URL` is absent. Confirm PASS rather than SKIP for:
+
+- `TestRedisClientIntegration`: host-to-Redis PING.
+- `TestRedisCacheRoundTripIntegration`: misses, JSON/expiry round trip, positive bounded TTL, idempotent deletion, and skipped zero/negative/sub-millisecond TTLs.
+- `TestRedisCacheNamespaceIntegration`: the same code can hold different values in separate namespaces, and deleting one does not affect the other.
+
+These tests use generated keys/namespaces and clean up their own entries; they do not flush Redis. Cache-wrapper unit tests use test doubles and do not require either external service.
+
 Automated tests cover:
 
 - Store save/lookup, missing records, collision preservation, and concurrent access.
@@ -445,8 +556,13 @@ Automated tests cover:
 - Memory and PostgreSQL deletion, missing records, preservation of unrelated records, and reuse of deleted codes.
 - Delete-handler success, expiry-independent deletion, empty 204 bodies, and storage failures.
 - Authentication rejection, empty-key configuration, handler execution control, and actual record preservation during unauthorized deletion.
+- Cache TTL maximums, expiry boundaries, millisecond truncation, and skip-insertion cases.
+- Redis adapter operations, expiry serialization, finite TTLs, and namespace isolation.
+- Cache hits avoiding primary lookup and TTL refresh, fallback on misses/read errors, and successful reads despite cache-population errors.
+- Primary-error identity preservation, no cache population for primary failures, canceled requests, and primary-only saves.
+- Deletion operation order, invalidation failure preventing primary deletion, primary failure, and missing-record results through the wrapper.
 
-The developer reports that these tests pass with the race detector enabled and that vet reports no issues, including runs with real PostgreSQL integration tests enabled. Manual HTTP checks have verified creation, alias conflicts, metadata, redirects, expiry transitions, unauthorized deletion preservation, authorized deletion, and the basic endpoints. Handler tests call handlers directly; they do not automatically verify route registration. Passing race checks cover the executions tested, rather than proving every possible concurrent execution correct.
+The developer reports that these tests pass with the race detector enabled and that vet reports no issues, including runs with real PostgreSQL and Redis integration tests enabled. Manual HTTP checks have verified creation, alias conflicts, metadata, redirects, expiry transitions, unauthorized deletion preservation, authorized deletion, Redis fallback/recovery, invalidation, and code reuse. Handler tests call handlers directly; they do not automatically verify route registration. Passing race checks cover the executions tested, rather than proving every possible concurrent execution correct.
 
 ### Coverage
 
@@ -459,15 +575,17 @@ go tool cover "-func=coverage.out"
 
 Quote the complete flags as shown to avoid argument-parsing problems in PowerShell. The generated `coverage.out` file is ignored by Git.
 
-The Module 2 run shared on October 21, 2026 reported **73.6% total statement coverage**, with all tests passing. At that point, the service, repository implementation, handlers, request decoder, validator, and service-error mapping each reported 100%. `generateCode` and `writeJSON` each reported 75%; `main` reported 0%. This is historical coverage from before PostgreSQL support, not a measurement of the current code. Run the commands above with `TEST_DATABASE_URL` set for an updated report that includes integration tests.
+The Module 2 run shared on October 21, 2026 reported **73.6% total statement coverage**, with all tests passing. At that point, the service, repository implementation, handlers, request decoder, validator, and service-error mapping each reported 100%. `generateCode` and `writeJSON` each reported 75%; `main` reported 0%. This is historical coverage from before PostgreSQL, lifecycle, and Redis support, not a measurement of the current code. Set both `TEST_DATABASE_URL` and `TEST_REDIS_URL` for an updated report that includes the integration tests.
 
-Startup and shutdown remain outside the automated suite, and error branches in the random generator and JSON writer remain uncovered. Basic shutdown has been checked manually. Coverage records executed statements; assertions are still needed to establish correct results, and 100% coverage does not prove every edge case is handled.
+The recorded report left startup/shutdown and some error branches uncovered; no updated coverage figure has been reported for the current code. Process startup and basic shutdown have been checked manually. Coverage records executed statements; assertions are still needed to establish correct results, and 100% coverage does not prove every edge case is handled.
 
 ## Current limitations
 
 - Memory storage has no capacity limit and is cleared on process exit. Persistence requires selecting the PostgreSQL backend.
 - The listen address and public short-link base URL are fixed in application setup.
-- Rate limiting, Redis caching, analytics, and the optional update endpoint are not implemented yet.
+- Rate limiting, analytics, and the optional update endpoint are not implemented yet.
+- Cache coordination supports the current single-process setup, not distributed invalidation across multiple active servers or external database writers.
+- Redis outages allow read fallback but prevent deletion while invalidation is unavailable. Cache stampede prevention and performance benchmarks are not implemented.
 - Authentication is one shared management key protecting deletion; there is no per-user ownership or credential rotation mechanism.
 - The database stores an ID and creation timestamp, but metadata currently exposes only the code, original URL, and optional expiry.
 - Expired records are retained without automatic cleanup. Their codes remain reserved until explicit deletion, which releases the code for reuse.
@@ -476,7 +594,7 @@ Startup and shutdown remain outside the automated suite, and error branches in t
 
 ## Manual persistence and outage checks
 
-The developer reports verifying the following against local PostgreSQL:
+The developer reports verifying the following against local PostgreSQL, with Redis caching disabled for the original database-outage check:
 
 1. Create a link in PostgreSQL mode, stop and restart only the Go server, and query the same code. Metadata still returns 200 and the short URL returns 302 with the original destination.
 2. Leave Go running and temporarily stop the local PostgreSQL service. Metadata and redirect requests return 500, while `/healthz` continues returning 200.
@@ -498,6 +616,46 @@ Start-Service -Name 'postgresql-x64-18'
 
 The Go server must remain running in PostgreSQL mode throughout the outage/recovery check. The request examples above can be reused with `curl.exe --max-time 10 -i` to bound client waiting. Curl's timeout is a client limit, not a server query deadline. These restart and outage checks are manual, not automated service-control tests.
 
+### Redis behavior verified manually
+
+With PostgreSQL and Redis caching enabled, the developer verified:
+
+1. Creation saves only to primary storage; the first lookup populates a namespaced key. Repeated access returns the correct destination while PTTL decreases rather than resetting to five minutes.
+2. Stopping Redis leaves metadata and redirects working through PostgreSQL. Authorized deletion returns 500 and the primary record remains accessible. Restarting Redis restores normal operation without restarting Go.
+3. Successful deletion returns 204, removes the Redis key, and makes metadata and redirects return 404. Reusing the exact code for a different destination returns the replacement, not stale cached data.
+4. A link with a two-minute deadline receives a cache TTL below 120000 ms. After its deadline, Redis reports no key and metadata/redirect requests return 410. Repeated expired lookups do not repopulate Redis.
+
+For a fresh link created using the earlier request example, inspect the cache from the request terminal:
+
+```powershell
+$metadataURL = "http://127.0.0.1:8080/api/v1/urls/$($link.code)"
+$pattern = "url-shortener:v1:url:*:$($link.code)"
+curl.exe -i $metadataURL
+
+$redisKey = docker exec url-shortener-redis redis-cli --scan --pattern $pattern
+$redisKey
+docker exec url-shortener-redis redis-cli PTTL $redisKey
+```
+
+Use a newly created code in the current server run so the pattern identifies its active key. PTTL is in milliseconds and should be positive and at most 300000 for a permanent link. An expiring link is limited by its remaining lifetime. Cache hits do not extend it.
+
+To repeat the Redis outage check, keep Go and PostgreSQL running:
+
+```powershell
+docker stop url-shortener-redis
+curl.exe --max-time 10 -i $metadataURL
+curl.exe --max-time 10 -i $link.short_url
+```
+
+Expect 200 and 302 for an active link. Restore Redis even if a request differs from expectations:
+
+```powershell
+docker start url-shortener-redis
+docker exec url-shortener-redis redis-cli ping
+```
+
+Use the protected-deletion instructions above to verify 500 during invalidation failure and 204 after recovery. Functional checks do not establish a measured latency or throughput improvement; benchmarking remains future work.
+
 ## Shutdown and timeouts
 
 Press **Ctrl+C** in the server terminal. Expected log messages include:
@@ -516,6 +674,8 @@ curl.exe -i http://127.0.0.1:8080/healthz
 ```
 
 Request headers have a separate five-second read timeout. This does not limit request-body reading or handler execution.
+
+With caching enabled, Redis operations have separate child-context budgets; primary storage still uses the parent request context. Normal shutdown closes the Redis client as well as the PostgreSQL pool after HTTP shutdown.
 
 Basic shutdown and connection refusal afterward have been checked manually. Allowing an active request to finish during shutdown has not yet been verified.
 

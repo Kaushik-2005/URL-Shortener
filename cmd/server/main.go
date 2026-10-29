@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log"
@@ -35,6 +36,36 @@ func main() {
 
 	default:
 		log.Fatalf("Unknown STORAGE_BACKEND: %q", backend)
+	}
+
+	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		if os.Getenv("STORAGE_BACKEND") != "postgres" {
+			log.Fatal("REDIS_URL requires STORAGE_BACKEND=postgres")
+		}
+
+		client, err := newRedisClient(redisURL)
+		if err != nil {
+			log.Fatalf("Configure Redis: %v", err)
+		}
+
+		defer func() {
+			if err := client.Close(); err != nil {
+				log.Printf("Close Redis: %v", err)
+			}
+		}()
+
+		cache := &redisCache{
+			client:    client,
+			namespace: rand.Text(),
+		}
+
+		store = &cachedStore{
+			primary: store,
+			cache:   cache,
+			maxTTL:  5 * time.Minute,
+		}
+
+		log.Println("Redis lookup caching configured")
 	}
 
 	managementKey := os.Getenv("MANAGEMENT_API_KEY")
