@@ -73,6 +73,16 @@ func TestValidateAlias(t *testing.T) {
 			alias:   "café",
 			wantErr: true,
 		},
+		{
+			name:    "reserved readniess endpoint",
+			alias:   "readyz",
+			wantErr: true,
+		},
+		{
+			name:    "reserved readiness endpoint with mixed case",
+			alias:   "ReAdYz",
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {

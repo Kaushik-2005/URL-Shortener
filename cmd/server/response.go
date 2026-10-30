@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -44,6 +45,12 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		http.Error(w, "expiry must be in the future", http.StatusBadRequest)
 	case errors.Is(err, errURLExpired):
 		http.Error(w, "URL has expired", http.StatusGone)
+	case errors.Is(err, context.DeadlineExceeded):
+		http.Error(
+			w,
+			"request deadline exceeded",
+			http.StatusServiceUnavailable,
+		)
 	default:
 		log.Printf("Service error: %v", err)
 		http.Error(w, "internal server error", http.StatusInternalServerError)

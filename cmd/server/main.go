@@ -5,7 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,44 +13,58 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	if err := run(logger); err != nil {
+		logger.Error("Server failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run(logger *slog.Logger) error {
 	mux := http.NewServeMux()
 	var store urlStore
+	var readinessCheck func(context.Context) error
 
 	switch backend := os.Getenv("STORAGE_BACKEND"); backend {
 	case "", "memory":
 		store = newMemoryStore()
+		readinessCheck = func(context.Context) error {
+			return nil
+		}
 
 	case "postgres":
 		databaseURL := os.Getenv("DATABASE_URL")
 		if databaseURL == "" {
-			log.Fatal("DATABASE_URL is required for PostgreSQL storage")
+			return errors.New("DATABASE_URL is required for PostgreSQL storage")
 		}
 
 		pool, err := openPostgres(context.Background(), databaseURL)
 		if err != nil {
-			log.Fatalf("Open PostgreSQL: %v", err)
+			return fmt.Errorf("Open PostgreSQL: %w", err)
 		}
 		defer pool.Close()
 
 		store = &postgresStore{pool: pool}
+		readinessCheck = pool.Ping
 
 	default:
-		log.Fatalf("Unknown STORAGE_BACKEND: %q", backend)
+		return fmt.Errorf("unknown STORAGE_BACKEND: %q", backend)
 	}
 
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
 		if os.Getenv("STORAGE_BACKEND") != "postgres" {
-			log.Fatal("REDIS_URL requires STORAGE_BACKEND=postgres")
+			return errors.New("REDIS_URL requires STORAGE_BACKEND=postgres")
 		}
 
 		client, err := newRedisClient(redisURL)
 		if err != nil {
-			log.Fatalf("Configure Redis: %v", err)
+			return fmt.Errorf("Configure Redis: %w", err)
 		}
 
 		defer func() {
 			if err := client.Close(); err != nil {
-				log.Printf("Close Redis: %v", err)
+				logger.Warn("Close Redis failed", "error", err)
 			}
 		}()
 
@@ -65,7 +79,7 @@ func main() {
 			maxTTL:  5 * time.Minute,
 		}
 
-		log.Println("Redis lookup caching configured")
+		logger.Info("Redis lookup caching configured")
 	}
 
 	managementKey := os.Getenv("MANAGEMENT_API_KEY")
@@ -75,7 +89,7 @@ func main() {
 			newDeleteURLHandler(store),
 		)
 		if err != nil {
-			log.Fatalf("Configure management authentication: %v", err)
+			return fmt.Errorf("Configure management authentication: %w", err)
 		}
 
 		mux.Handle(
@@ -86,9 +100,22 @@ func main() {
 
 	baseURL := "http://127.0.0.1:8080"
 
-	mux.HandleFunc(
+	createLimiter, err := newCreateLimiter(
+		10,
+		time.Minute,
+		time.Now(),
+	)
+	if err != nil {
+		return fmt.Errorf("configure creation rate limit: %w", err)
+	}
+
+	mux.Handle(
 		"POST /api/v1/urls",
-		newCreateURLHandler(store, baseURL, generateCode),
+		withCreateRateLimit(
+			createLimiter,
+			time.Now,
+			newCreateURLHandler(store, baseURL, generateCode),
+		),
 	)
 
 	mux.HandleFunc("GET /{code}", newRedirectHandler(store))
@@ -97,6 +124,8 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "OK")
 	})
+
+	mux.HandleFunc("GET /readyz", newReadinessHandler(readinessCheck))
 
 	mux.HandleFunc(
 		"GET /api/v1/urls/{code}",
@@ -109,9 +138,17 @@ func main() {
 	})
 
 	server := &http.Server{
-		Addr:              "127.0.0.1:8080",
-		Handler:           mux,
+		Addr: "127.0.0.1:8080",
+		Handler: withRequestID(
+			withRequestTimeout(
+				5*time.Second,
+				withRequestLogging(logger, mux),
+			),
+		),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -122,16 +159,16 @@ func main() {
 		serverErrors <- server.ListenAndServe()
 	}()
 
-	log.Printf("Starting server on http://%s", server.Addr)
+	logger.Info("Starting server", "address", server.Addr)
 
 	select {
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+			return fmt.Errorf("serve HTTP: %w", err)
 		}
-		return
+		return nil
 	case <-signalCtx.Done():
-		log.Println("Shutdown requested")
+		logger.Info("Shutdown requested")
 	}
 
 	stop()
@@ -140,7 +177,9 @@ func main() {
 	defer cancel()
 
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Graceful shutdown failed: %v", err)
+		return fmt.Errorf("Graceful shutdown failed: %w", err)
 	}
-	log.Println("Server stopped cleanly")
+	logger.Info("Server stopped cleanly")
+
+	return nil
 }

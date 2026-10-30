@@ -25,7 +25,7 @@ func validateAlias(alias string) error {
 	}
 
 	switch strings.ToLower(alias) {
-	case "healthz", "api":
+	case "healthz", "readyz", "api":
 		return errors.New("alias is reserved")
 	}
 
