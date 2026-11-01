@@ -49,13 +49,14 @@ func (s *postgresStore) get(
 	code string,
 ) (urlRecord, error) {
 	const query = `
-		SELECT code, original_url, expires_at
+		SELECT id, code, original_url, expires_at
 		FROM public.urls
 		WHERE code = $1
 	`
 
 	var record urlRecord
 	err := s.pool.QueryRow(ctx, query, code).Scan(
+		&record.ID,
 		&record.Code,
 		&record.OriginalURL,
 		&record.ExpiresAt,

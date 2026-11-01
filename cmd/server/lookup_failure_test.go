@@ -34,9 +34,11 @@ func TestLookupHandlersStorageFailure(t *testing.T) {
 		factory func(urlRepository) http.HandlerFunc
 	}{
 		{
-			name:    "redirect",
-			path:    "/abc12345",
-			factory: newRedirectHandler,
+			name: "redirect",
+			path: "/abc12345",
+			factory: func(repository urlRepository) http.HandlerFunc {
+				return newRedirectHandler(repository, newMemoryStore())
+			},
 		},
 		{
 			name:    "metadata",

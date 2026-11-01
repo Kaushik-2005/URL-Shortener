@@ -5,7 +5,10 @@ import (
 	"time"
 )
 
-func newRedirectHandler(store urlRepository) http.HandlerFunc {
+func newRedirectHandler(
+	store urlRepository,
+	recorder clickRecorder,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		code := r.PathValue("code")
 
@@ -15,9 +18,17 @@ func newRedirectHandler(store urlRepository) http.HandlerFunc {
 			return
 		}
 
-		if record.isExpired(time.Now()) {
+		at := time.Now()
+		if record.isExpired(at) {
 			writeServiceError(w, errURLExpired)
 			return
+		}
+
+		if r.Method == http.MethodGet {
+			if err := recorder.recordClick(r.Context(), record.ID, at); err != nil {
+				writeServiceError(w, err)
+				return
+			}
 		}
 
 		http.Redirect(w, r, record.OriginalURL, http.StatusFound)

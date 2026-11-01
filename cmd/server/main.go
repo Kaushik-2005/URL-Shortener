@@ -24,11 +24,16 @@ func main() {
 func run(logger *slog.Logger) error {
 	mux := http.NewServeMux()
 	var store urlStore
+	var statisticsReader clickStatisticsReader
 	var readinessCheck func(context.Context) error
+	var recorder clickRecorder
 
 	switch backend := os.Getenv("STORAGE_BACKEND"); backend {
 	case "", "memory":
-		store = newMemoryStore()
+		memory := newMemoryStore()
+		store = memory
+		statisticsReader = memory
+		recorder = memory
 		readinessCheck = func(context.Context) error {
 			return nil
 		}
@@ -45,12 +50,17 @@ func run(logger *slog.Logger) error {
 		}
 		defer pool.Close()
 
-		store = &postgresStore{pool: pool}
+		postgres := &postgresStore{pool: pool}
+		store = postgres
+		statisticsReader = postgres
+		recorder = postgres
 		readinessCheck = pool.Ping
 
 	default:
 		return fmt.Errorf("unknown STORAGE_BACKEND: %q", backend)
 	}
+
+	primaryStore := store
 
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
 		if os.Getenv("STORAGE_BACKEND") != "postgres" {
@@ -92,6 +102,19 @@ func run(logger *slog.Logger) error {
 			return fmt.Errorf("Configure management authentication: %w", err)
 		}
 
+		statisticsHandler, err := requireAPIKey(
+			managementKey,
+			newStatisticsHandler(primaryStore, statisticsReader),
+		)
+		if err != nil {
+			return fmt.Errorf("configure statistics authentication: %w", err)
+		}
+
+		mux.Handle(
+			"GET /api/v1/urls/{code}/stats",
+			statisticsHandler,
+		)
+
 		mux.Handle(
 			"DELETE /api/v1/urls/{code}",
 			deleteHandler,
@@ -118,7 +141,7 @@ func run(logger *slog.Logger) error {
 		),
 	)
 
-	mux.HandleFunc("GET /{code}", newRedirectHandler(store))
+	mux.HandleFunc("GET /{code}", newRedirectHandler(store, recorder))
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")

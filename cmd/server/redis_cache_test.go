@@ -34,6 +34,7 @@ func TestRedisCacheRoundTripIntegration(t *testing.T) {
 		2030, time.January, 1, 12, 0, 0, 123456000, time.UTC,
 	)
 	record := urlRecord{
+		ID:          42,
 		Code:        "cache_" + suffix,
 		OriginalURL: "https://example.com/cache-test",
 		ExpiresAt:   &deadline,
@@ -77,6 +78,9 @@ func TestRedisCacheRoundTripIntegration(t *testing.T) {
 		t.Fatalf("get cached record: %v", err)
 	}
 
+	if got.ID != record.ID {
+		t.Errorf("cached ID = %d, want %d", got.ID, record.ID)
+	}
 	if got.Code != record.Code || got.OriginalURL != record.OriginalURL {
 		t.Errorf("cached record = %+v, want matching code and URL", got)
 	}

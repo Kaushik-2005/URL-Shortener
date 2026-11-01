@@ -48,6 +48,14 @@ func TestDeleteURLHandler(t *testing.T) {
 				t.Fatalf("save other record: %v", err)
 			}
 
+			otherBefore, err := store.get(ctx, other.Code)
+			if err != nil {
+				t.Fatalf("get other before deletion: %v", err)
+			}
+			if otherBefore.ID <= 0 {
+				t.Fatalf("other ID = %d, want positive ID", otherBefore.ID)
+			}
+
 			if tt.seedTarget {
 				err := store.save(ctx, urlRecord{
 					Code:        "delete-me",
@@ -85,8 +93,8 @@ func TestDeleteURLHandler(t *testing.T) {
 			if err != nil {
 				t.Fatalf("get other record: %v", err)
 			}
-			if savedOther != other {
-				t.Errorf("other record = %+v, want %+v", savedOther, other)
+			if savedOther != otherBefore {
+				t.Errorf("other record = %+v, want %+v", savedOther, otherBefore)
 			}
 		})
 	}

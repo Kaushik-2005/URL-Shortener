@@ -40,8 +40,15 @@ func TestURLServiceCreateSuccess(t *testing.T) {
 		t.Fatalf("get saved record: %v", lookupErr)
 	}
 
-	if saved != want {
-		t.Errorf("saved record = %+v, want %+v", saved, want)
+	if saved.ID <= 0 {
+		t.Errorf("saved ID = %d, want positive ID", saved.ID)
+	}
+
+	wantSaved := want
+	wantSaved.ID = saved.ID
+
+	if saved != wantSaved {
+		t.Errorf("saved record = %+v, want %+v", saved, wantSaved)
 	}
 
 	if generatorCalls != 1 {
@@ -191,6 +198,14 @@ func TestURLServiceCreateRetriesCollision(t *testing.T) {
 		t.Fatalf("save original: %v", err)
 	}
 
+	originalBefore, err := repository.get(context.Background(), original.Code)
+	if err != nil {
+		t.Fatalf("get original before retry: %v", err)
+	}
+	if originalBefore.ID <= 0 {
+		t.Fatalf("original ID = %d, want positive ID", originalBefore.ID)
+	}
+
 	generatorCalls := 0
 	service := &urlService{
 		repository: repository,
@@ -229,8 +244,12 @@ func TestURLServiceCreateRetriesCollision(t *testing.T) {
 		t.Fatalf("get original record: %v", lookupErr)
 	}
 
-	if savedOriginal != original {
-		t.Errorf("original record = %+v, want %+v", savedOriginal, original)
+	if savedOriginal != originalBefore {
+		t.Errorf(
+			"original record = %+v, want %+v",
+			savedOriginal,
+			originalBefore,
+		)
 	}
 
 	savedNew, lookupErr := repository.get(context.Background(), want.Code)
@@ -238,8 +257,18 @@ func TestURLServiceCreateRetriesCollision(t *testing.T) {
 		t.Fatalf("get new record: %v", lookupErr)
 	}
 
-	if savedNew != want {
-		t.Errorf("new record = %+v, want %+v", savedNew, want)
+	if savedNew.ID <= 0 {
+		t.Fatalf("new ID = %d, want positive ID", savedNew.ID)
+	}
+	if savedNew.ID == originalBefore.ID {
+		t.Errorf("new record reused original ID %d", originalBefore.ID)
+	}
+
+	wantSaved := want
+	wantSaved.ID = savedNew.ID
+
+	if savedNew != wantSaved {
+		t.Errorf("new record = %+v, want %+v", savedNew, wantSaved)
 	}
 }
 
@@ -252,6 +281,14 @@ func TestURLServiceCreateCollisionLimit(t *testing.T) {
 
 	if err := repository.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
+	}
+
+	originalBefore, err := repository.get(context.Background(), original.Code)
+	if err != nil {
+		t.Fatalf("get original before retry exhaustion: %v", err)
+	}
+	if originalBefore.ID <= 0 {
+		t.Fatalf("original ID = %d, want positive ID", originalBefore.ID)
 	}
 
 	generatorCalls := 0
@@ -282,8 +319,8 @@ func TestURLServiceCreateCollisionLimit(t *testing.T) {
 		t.Fatalf("get original after retry exhaustion: %v", lookupErr)
 	}
 
-	if saved != original {
-		t.Errorf("original record = %+v, want %+v", saved, original)
+	if saved != originalBefore {
+		t.Errorf("original record = %+v, want %+v", saved, originalBefore)
 	}
 
 	repository.mu.RLock()
@@ -334,9 +371,17 @@ func TestURLServiceCreateWithAliasSuccess(t *testing.T) {
 		t.Fatalf("get saved record: %v", lookupErr)
 	}
 
-	if saved != want {
-		t.Errorf("saved record = %+v, want %+v", saved, want)
+	if saved.ID <= 0 {
+		t.Fatalf("saved ID = %d, want positive ID", saved.ID)
 	}
+
+	wantSaved := want
+	wantSaved.ID = saved.ID
+
+	if saved != wantSaved {
+		t.Errorf("saved record = %+v, want %+v", saved, wantSaved)
+	}
+
 	if generatorCalls != 0 {
 		t.Errorf("generator calls = %d, want 0", generatorCalls)
 	}
@@ -351,6 +396,14 @@ func TestURLServiceCreateWithAliasConflict(t *testing.T) {
 
 	if err := repository.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
+	}
+
+	originalBefore, err := repository.get(context.Background(), original.Code)
+	if err != nil {
+		t.Fatalf("get original before alias conflict: %v", err)
+	}
+	if originalBefore.ID <= 0 {
+		t.Fatalf("original ID = %d, want positive ID", originalBefore.ID)
 	}
 
 	generatorCalls := 0
@@ -385,8 +438,12 @@ func TestURLServiceCreateWithAliasConflict(t *testing.T) {
 		t.Fatalf("get original: %v", lookupErr)
 	}
 
-	if saved != original {
-		t.Errorf("original record = %+v, want %+v", saved, original)
+	if saved != originalBefore {
+		t.Errorf("original record = %+v, want %+v", saved, originalBefore)
+	}
+
+	if saved.ID <= 0 {
+		t.Fatalf("saved ID = %d, want positive ID", saved.ID)
 	}
 
 	if generatorCalls != 0 {

@@ -17,21 +17,25 @@ func TestLookupHandlersExpiry(t *testing.T) {
 	handlers := []struct {
 		name         string
 		path         string
-		factory      func(urlRepository) http.HandlerFunc
+		factory      func(*memoryStore) http.HandlerFunc
 		activeStatus int
 		location     string
 	}{
 		{
-			name:         "redirect",
-			path:         "/go-guide",
-			factory:      newRedirectHandler,
+			name: "redirect",
+			path: "/go-guide",
+			factory: func(store *memoryStore) http.HandlerFunc {
+				return newRedirectHandler(store, store)
+			},
 			activeStatus: http.StatusFound,
 			location:     destination,
 		},
 		{
-			name:         "metadata",
-			path:         "/api/v1/urls/go-guide",
-			factory:      newMetadataHandler,
+			name: "metadata",
+			path: "/api/v1/urls/go-guide",
+			factory: func(store *memoryStore) http.HandlerFunc {
+				return newMetadataHandler(store)
+			},
 			activeStatus: http.StatusOK,
 		},
 	}

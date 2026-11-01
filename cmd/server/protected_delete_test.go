@@ -46,6 +46,14 @@ func TestProtectedDelete(t *testing.T) {
 				t.Fatalf("save record: %v", err)
 			}
 
+			before, err := store.get(context.Background(), record.Code)
+			if err != nil {
+				t.Fatalf("get record before deletion request: %v", err)
+			}
+			if before.ID <= 0 {
+				t.Fatalf("stored ID = %d, want positive ID", before.ID)
+			}
+
 			handler, err := requireAPIKey(key, newDeleteURLHandler(store))
 			if err != nil {
 				t.Fatalf("configure protected handler: %v", err)
@@ -83,8 +91,8 @@ func TestProtectedDelete(t *testing.T) {
 			if lookupErr != nil {
 				t.Fatalf("unauthorized request removed the record: %v", lookupErr)
 			}
-			if saved != record {
-				t.Errorf("record = %+v, want unchanged %+v", saved, record)
+			if saved != before {
+				t.Errorf("record = %+v, want unchanged %+v", saved, before)
 			}
 		})
 	}

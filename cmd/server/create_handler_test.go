@@ -191,6 +191,14 @@ func TestCreateURLHandlerRetriesCollision(t *testing.T) {
 		t.Fatalf("save original: %v", err)
 	}
 
+	originalBefore, err := store.get(context.Background(), original.Code)
+	if err != nil {
+		t.Fatalf("get original before retry: %v", err)
+	}
+	if originalBefore.ID <= 0 {
+		t.Fatalf("original ID = %d, want positive ID", originalBefore.ID)
+	}
+
 	calls := 0
 	generate := func() (string, error) {
 		calls++
@@ -243,8 +251,12 @@ func TestCreateURLHandlerRetriesCollision(t *testing.T) {
 		t.Fatalf("get original record: %v", lookupErr)
 	}
 
-	if gotOriginal != original {
-		t.Errorf("original record = %+v, want %+v", gotOriginal, original)
+	if gotOriginal != originalBefore {
+		t.Errorf(
+			"original record = %+v, want %+v",
+			gotOriginal,
+			originalBefore,
+		)
 	}
 
 	wantNew := urlRecord{
@@ -255,6 +267,15 @@ func TestCreateURLHandlerRetriesCollision(t *testing.T) {
 	if lookupErr != nil {
 		t.Fatalf("get new record: %v", lookupErr)
 	}
+
+	if gotNew.ID <= 0 {
+		t.Fatalf("new ID = %d, want positive ID", gotNew.ID)
+	}
+	if gotNew.ID == originalBefore.ID {
+		t.Errorf("new record reused original ID %d", originalBefore.ID)
+	}
+
+	wantNew.ID = gotNew.ID
 
 	if gotNew != wantNew {
 		t.Errorf("new record = %+v, want %+v", gotNew, wantNew)
@@ -270,6 +291,14 @@ func TestCreateURLHandlerCollisionLimit(t *testing.T) {
 
 	if err := store.save(context.Background(), original); err != nil {
 		t.Fatalf("save original: %v", err)
+	}
+
+	originalBefore, err := store.get(context.Background(), original.Code)
+	if err != nil {
+		t.Fatalf("get original before retry: %v", err)
+	}
+	if originalBefore.ID <= 0 {
+		t.Fatalf("original ID = %d, want positive ID", originalBefore.ID)
 	}
 
 	calls := 0
@@ -310,8 +339,12 @@ func TestCreateURLHandlerCollisionLimit(t *testing.T) {
 		t.Fatalf("get original after retry exhaustion: %v", lookupErr)
 	}
 
-	if got != original {
-		t.Errorf("original record = %+v, want %+v", got, original)
+	if got != originalBefore {
+		t.Errorf(
+			"original record = %+v, want %+v",
+			got,
+			originalBefore,
+		)
 	}
 
 	store.mu.RLock()
@@ -395,8 +428,15 @@ func TestCreateURLHandlerCustomAliasSuccess(t *testing.T) {
 		t.Fatalf("get saved alias: %v", err)
 	}
 
-	if saved != want {
-		t.Errorf("saved record = %+v, want %+v", saved, want)
+	if saved.ID <= 0 {
+		t.Fatalf("saved ID = %d, want positive ID", saved.ID)
+	}
+
+	wantSaved := want
+	wantSaved.ID = saved.ID
+
+	if saved != wantSaved {
+		t.Errorf("saved record = %+v, want %+v", saved, wantSaved)
 	}
 
 	if generatorCalls != 0 {
@@ -449,6 +489,14 @@ func TestCreateURLHandlerRejectsCustomAlias(t *testing.T) {
 				t.Fatalf("save original: %v", err)
 			}
 
+			originalBefore, err := store.get(context.Background(), original.Code)
+			if err != nil {
+				t.Fatalf("get original before rejected request: %v", err)
+			}
+			if originalBefore.ID <= 0 {
+				t.Fatalf("original ID = %d, want positive ID", originalBefore.ID)
+			}
+
 			generatorCalls := 0
 			handler := newCreateURLHandler(
 				store,
@@ -482,8 +530,8 @@ func TestCreateURLHandlerRejectsCustomAlias(t *testing.T) {
 				t.Fatalf("get original: %v", err)
 			}
 
-			if saved != original {
-				t.Errorf("original record = %+v, want %+v", saved, original)
+			if saved != originalBefore {
+				t.Errorf("original record = %+v, want %+v", saved, originalBefore)
 			}
 
 			store.mu.RLock()

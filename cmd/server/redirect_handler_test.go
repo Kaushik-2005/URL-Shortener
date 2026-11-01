@@ -39,7 +39,7 @@ func TestRedirectHandler(t *testing.T) {
 				t.Fatalf("save test record: %v", err)
 			}
 
-			handler := newRedirectHandler(store)
+			handler := newRedirectHandler(store, store)
 			request := httptest.NewRequest(
 				http.MethodGet,
 				"/"+tt.code,

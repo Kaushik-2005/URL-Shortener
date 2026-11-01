@@ -57,6 +57,21 @@ func TestPostgresStoreSaveLookupAndCollisionIntegration(t *testing.T) {
 		}
 	})
 
+	before, err := store.get(ctx, original.Code)
+	if err != nil {
+		t.Fatalf("get original before collision: %v", err)
+	}
+	if before.ID <= 0 {
+		t.Fatalf("original ID = %d, want positive ID", before.ID)
+	}
+
+	wantStored := original
+	wantStored.ID = before.ID
+
+	if before != wantStored {
+		t.Fatalf("stored record = %+v, want %+v", before, wantStored)
+	}
+
 	duplicate := urlRecord{
 		Code:        original.Code,
 		OriginalURL: "https://example.com/replacement",
@@ -71,8 +86,8 @@ func TestPostgresStoreSaveLookupAndCollisionIntegration(t *testing.T) {
 		t.Fatalf("get original: %v", err)
 	}
 
-	if got != original {
-		t.Errorf("stored record = %+v, want %+v", got, original)
+	if got != before {
+		t.Errorf("record after collision = %+v, want %+v", got, before)
 	}
 
 	missing, err := store.get(ctx, "missing_"+suffix)
@@ -172,9 +187,17 @@ func TestPostgresStoreConcurrentInsertIntegration(t *testing.T) {
 		t.Fatalf("get saved record: %v", err)
 	}
 
-	if got != record {
-		t.Errorf("stored record = %+v, want %+v", got, record)
+	if got.ID <= 0 {
+		t.Fatalf("stored ID = %d, want positive ID", got.ID)
 	}
+
+	wantStored := record
+	wantStored.ID = got.ID
+
+	if got != wantStored {
+		t.Errorf("stored record = %+v, want %+v", got, wantStored)
+	}
+
 }
 
 func TestPostgresStoreExpiryRoundTripIntegration(t *testing.T) {
@@ -309,6 +332,22 @@ func TestPostgresStoreDeleteIntegration(t *testing.T) {
 	saveRecord(target)
 	saveRecord(other)
 
+	targetBefore, err := store.get(ctx, target.Code)
+	if err != nil {
+		t.Fatalf("get target before deletion: %v", err)
+	}
+	if targetBefore.ID <= 0 {
+		t.Fatalf("target ID = %d, want positive ID", targetBefore.ID)
+	}
+
+	otherBefore, err := store.get(ctx, other.Code)
+	if err != nil {
+		t.Fatalf("get other before deletion: %v", err)
+	}
+	if otherBefore.ID <= 0 {
+		t.Fatalf("other ID = %d, want positive ID", otherBefore.ID)
+	}
+
 	if err := store.delete(ctx, target.Code); err != nil {
 		t.Fatalf("delete target: %v", err)
 	}
@@ -329,8 +368,8 @@ func TestPostgresStoreDeleteIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get other record: %v", err)
 	}
-	if savedOther != other {
-		t.Errorf("other record = %+v, want %+v", savedOther, other)
+	if savedOther != otherBefore {
+		t.Errorf("other record = %+v, want %+v", savedOther, otherBefore)
 	}
 
 	replacement := urlRecord{
@@ -343,10 +382,21 @@ func TestPostgresStoreDeleteIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get replacement: %v", err)
 	}
-	if savedReplacement != replacement {
+	if savedReplacement.ID <= 0 {
+		t.Fatalf("replacement ID = %d, want positive ID", savedReplacement.ID)
+	}
+	if savedReplacement.ID == targetBefore.ID {
+		t.Errorf("replacement reused deleted ID %d", targetBefore.ID)
+	}
+
+	wantReplacement := replacement
+	wantReplacement.ID = savedReplacement.ID
+
+	if savedReplacement != wantReplacement {
 		t.Errorf(
 			"replacement = %+v, want %+v",
-			savedReplacement, replacement,
+			savedReplacement,
+			wantReplacement,
 		)
 	}
 }

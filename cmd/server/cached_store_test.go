@@ -103,6 +103,7 @@ func (c *stubCache) delete(
 
 func TestCachedStoreGetHit(t *testing.T) {
 	want := urlRecord{
+		ID:          41,
 		Code:        "go-guide",
 		OriginalURL: "https://example.com/guide",
 	}
@@ -138,6 +139,7 @@ func TestCachedStoreGetHit(t *testing.T) {
 
 func TestCachedStoreGetFallback(t *testing.T) {
 	want := urlRecord{
+		ID:          42,
 		Code:        "go-guide",
 		OriginalURL: "https://example.com/guide",
 	}
