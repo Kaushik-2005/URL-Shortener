@@ -12,6 +12,7 @@ func TestRunRejectsInvalidConfiguration(t *testing.T) {
 		backend  string
 		redisURL string
 		wantErr  string
+		baseURL  string
 	}{
 		{
 			name:    "unknown storage backend",
@@ -24,12 +25,19 @@ func TestRunRejectsInvalidConfiguration(t *testing.T) {
 			redisURL: "redis://127.0.0.1:6379/0",
 			wantErr:  "REDIS_URL requires STORAGE_BACKEND=postgres",
 		},
+		{
+			name:    "public base URL with path prefix",
+			backend: "memory",
+			baseURL: "https://sho.rt/short",
+			wantErr: "configure public base URL: public base URL must not include a path prefix",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("STORAGE_BACKEND", tt.backend)
 			t.Setenv("REDIS_URL", tt.redisURL)
+			t.Setenv("PUBLIC_BASE_URL", tt.baseURL)
 
 			logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
 

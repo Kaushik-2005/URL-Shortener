@@ -1,0 +1,79 @@
+name: url-shortener-dev
+
+services:
+  postgres:
+    image: postgres:18.6-bookworm
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: url_shortener
+      POSTGRES_PASSWORD: "${POSTGRES_ADMIN_PASSWORD:?Set POSTGRES_ADMIN_PASSWORD}"
+      APP_DATABASE_PASSWORD: "${APP_DATABASE_PASSWORD:?Set APP_DATABASE_PASSWORD}"
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - type: bind
+        source: ./docker/postgres/001_create_app_role.sql
+        target: /docker-entrypoint-initdb.d/001_create_app_role.sql
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres", "-d", "url_shortener"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  migrate:
+    image: migrate/migrate:v4.20.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./migrations
+        target: /migrations
+        read_only: true
+        bind:
+          create_host_path: false
+    command:
+      - "-path=/migrations"
+      - "-database=${COMPOSE_DATABASE_URL:?Set COMPOSE_DATABASE_URL}"
+      - "up"
+    restart: "no"
+
+  redis:
+    image: redis:8
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+  app:
+    build: .
+    image: url-shortener:module8
+    environment:
+      HTTP_ADDR: "0.0.0.0:8080"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL:-http://127.0.0.1:8080}"
+      STORAGE_BACKEND: postgres
+      DATABASE_URL: "${COMPOSE_DATABASE_URL:?Set COMPOSE_DATABASE_URL}"
+      REDIS_URL: "redis://redis:6379/0"
+      MANAGEMENT_API_KEY: "${MANAGEMENT_API_KEY:?Set MANAGEMENT_API_KEY}"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    stop_grace_period: 10s
+volumes:
+  postgres_data:

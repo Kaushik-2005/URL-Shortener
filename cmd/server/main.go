@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -121,7 +122,15 @@ func run(logger *slog.Logger) error {
 		)
 	}
 
-	baseURL := "http://127.0.0.1:8080"
+	baseURL := os.Getenv("PUBLIC_BASE_URL")
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:8080"
+	}
+
+	baseURL, err := normalizePublicBaseURL(baseURL)
+	if err != nil {
+		return fmt.Errorf("configure public base URL: %w", err)
+	}
 
 	createLimiter, err := newCreateLimiter(
 		10,
@@ -160,8 +169,13 @@ func run(logger *slog.Logger) error {
 		fmt.Fprintln(w, "Hello, Go!")
 	})
 
+	address := os.Getenv("HTTP_ADDR")
+	if address == "" {
+		address = "127.0.0.1:8080"
+	}
+
 	server := &http.Server{
-		Addr: "127.0.0.1:8080",
+		Addr: address,
 		Handler: withRequestID(
 			withRequestTimeout(
 				5*time.Second,
@@ -174,7 +188,11 @@ func run(logger *slog.Logger) error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	signalCtx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
 	defer stop()
 
 	serverErrors := make(chan error, 1)

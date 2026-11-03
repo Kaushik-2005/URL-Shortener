@@ -1,0 +1,26 @@
+# Git history
+.git
+
+# Local agent and credential directories
+**/.agents
+**/.codex
+**/.aws
+
+# Local environment files
+**/.env
+**/.env.*
+
+# Build output and profiles
+bin
+dist
+.dist
+coverage
+**/*.exe
+**/*.test
+**/*.out
+**/*.prof
+coverage.html
+
+# Operating-system metadata
+**/.DS_Store
+**/Thumbs.db
