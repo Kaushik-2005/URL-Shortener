@@ -1,1017 +1,609 @@
 # Go URL Shortener
 
-This project teaches Go and backend development. It uses the standard-library `net/http` package.
+A URL shortener built with Go and the standard-library `net/http` package. It supports persistent links, custom aliases, expiry, Redis caching, and redirect statistics.
 
-The server creates short links with optional aliases and expiry times. It redirects active links and returns metadata. It records GET redirect counts and daily statistics. A management API key protects deletion and statistics.
+PostgreSQL stores URL records and click counts. Redis caches URL lookups. An in-memory backend supports local use and tests.
 
-The server uses memory storage or PostgreSQL. PostgreSQL mode can also use Redis as a cache. PostgreSQL records remain after server restarts. Memory records do not.
+## Features
 
-The server limits creation attempts and assigns request IDs. It also provides structured request logs, health checks, readiness checks, timeouts, and graceful shutdown.
-
-The developer completed implementation and functional checks for Modules 0 through 7. These modules cover HTTP, memory storage, interfaces, PostgreSQL, URL lifecycle, Redis, operational safeguards, and analytics.
-
-The developer typed the Module 7 code, tests, and migrations. The developer confirmed an understanding of the counting policy and synchronous writes. The full test suite passed with the race detector and both integration services enabled.
-
-Module 8 covers performance and deployment. The optional update endpoint is not implemented. Cache and analytics behavior have passed functional checks. No performance improvement has been measured.
+- Create short links with random codes or custom aliases.
+- Redirect active links with `302 Found`.
+- Set optional expiry deadlines and return `410 Gone` after expiry.
+- Read URL metadata and daily click statistics.
+- Protect deletion and statistics with a management API key.
+- Cache lookups with finite, expiry-aware TTLs.
+- Apply request IDs, creation rate limits, and request deadlines.
+- Run with Docker Compose and verify changes through GitHub Actions.
 
 ## Requirements
 
-- Go 1.26.6 or newer, as specified in `go.mod`.
-- For PostgreSQL storage: a running PostgreSQL server, `psql`, and the `golang-migrate` CLI. The local setup was verified with PostgreSQL 18.6, pgx v5.11.0, and migrate v4.20.1.
-- For caching: Redis, tested locally through the `redis:8` Docker image with go-redis v9.23.0. On Windows, Docker Desktop must be running its Linux-container engine.
+For the container setup:
 
-## Run
+- Docker Desktop with the Linux-container engine running.
+- Docker Compose.
+- PowerShell for the commands below.
 
-From the project root, start with in-memory storage:
+For local Go development:
 
-```powershell
-$env:STORAGE_BACKEND = 'memory'
-$env:REDIS_URL = ''
-go run ./cmd/server
-```
+- Go 1.26.6, as specified in `go.mod`.
+- PostgreSQL and Redis for integration tests.
 
-The server listens on `http://127.0.0.1:8080` and is accessible from the local computer. An unset or empty `STORAGE_BACKEND` also selects memory storage. For persistence, complete the PostgreSQL setup below before starting the server with that backend.
+The repository uses pgx v5.11.0 and go-redis v9.23.0. Compose uses PostgreSQL 18.6, Redis 8, and migrate v4.20.1.
 
-| Environment variable | Purpose |
-| --- | --- |
-| `STORAGE_BACKEND` | Empty or `memory` selects memory storage; `postgres` selects PostgreSQL. Other values fail startup. |
-| `DATABASE_URL` | Required for PostgreSQL server mode. Ignored in memory mode. |
-| `TEST_DATABASE_URL` | Enables real PostgreSQL integration tests. Separate from application configuration. |
-| `REDIS_URL` | Nonempty enables Redis caching and requires `STORAGE_BACKEND=postgres`; unset or empty disables caching. |
-| `TEST_REDIS_URL` | Enables Redis client and adapter integration tests independently of server configuration. |
-| `MANAGEMENT_API_KEY` | Enables protected deletion and statistics routes. Empty or unset disables both routes. Whitespace-only configuration fails startup. |
+## Quick start
 
-The application reads process environment variables. It does not load a `.env` file automatically.
+Run these commands from the repository root. Port 8080 must be available.
 
-## PostgreSQL setup on Windows
+### 1. Configure the stack
 
-### Create a development database
+Enter development passwords and a nonempty management key. These values remain in the current PowerShell process.
 
-Install PostgreSQL Server and Command Line Tools if needed. pgAdmin is optional; Stack Builder add-ons are not required. Use the [official Windows installer page](https://www.postgresql.org/download/windows/).
+~~~powershell
+$adminInput = Read-Host 'PostgreSQL admin password' -AsSecureString
+$env:POSTGRES_ADMIN_PASSWORD = [System.Net.NetworkCredential]::new('', $adminInput).Password
 
-The examples below use the installed PostgreSQL 18 client and default port. Adjust the path and port for your installation:
+$appInput = Read-Host 'Application database password' -AsSecureString
+$env:APP_DATABASE_PASSWORD = [System.Net.NetworkCredential]::new('', $appInput).Password
 
-```powershell
-& 'C:\Program Files\PostgreSQL\18\bin\psql.exe' -h localhost -p 5432 -U postgres -d postgres -W
-```
+$keyInput = Read-Host 'Management API key' -AsSecureString
+$env:MANAGEMENT_API_KEY = [System.Net.NetworkCredential]::new('', $keyInput).Password
 
-For a new setup, type these at the `psql` prompt, one at a time:
+$encodedPassword = [Uri]::EscapeDataString($env:APP_DATABASE_PASSWORD)
+$env:COMPOSE_DATABASE_URL = "postgres://url_shortener_dev:${encodedPassword}@postgres:5432/url_shortener?sslmode=disable&pool_max_conns=10"
+$env:PUBLIC_BASE_URL = 'http://127.0.0.1:8080'
+~~~
 
-```sql
-CREATE ROLE url_shortener_dev LOGIN;
-```
+Do not commit credentials. The Go application reads environment variables. It does not load a `.env` file automatically.
 
-Set its password interactively:
+### 2. Build and start
 
-```text
-\password url_shortener_dev
-```
+~~~powershell
+docker compose config --quiet
+docker compose up --detach --build app
+docker compose ps --all
+~~~
 
-Then create the project database:
+Compose waits for healthy PostgreSQL and Redis services. It applies pending migrations before it starts the application.
 
-```sql
-CREATE DATABASE url_shortener OWNER url_shortener_dev;
-```
+The first build can take several minutes. The migration service should exit with code 0.
 
-To exit psql, enter `\q`. If the role and database already exist, do not create them again.
+### 3. Check the service
 
-The development role owns the database and runs migrations. It is not a PostgreSQL superuser. A deployed application can use a role with fewer permissions.
+~~~powershell
+curl.exe --fail --show-error -i http://127.0.0.1:8080/healthz
+curl.exe --fail --show-error -i http://127.0.0.1:8080/readyz
+~~~
 
-### Install the migration runner
+Both endpoints should return `200 OK`.
 
-From PowerShell:
-
-```powershell
-go install -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@v4.20.1
-
-$migrationBin = go env GOBIN
-if ([string]::IsNullOrWhiteSpace($migrationBin)) {
-    $migrationBin = Join-Path (go env GOPATH) 'bin'
-}
-
-& (Join-Path $migrationBin 'migrate.exe') -help
-```
-
-This installs a separate tool without adding it to the application's `go.mod`. The project already records its pgx dependency in `go.mod` and `go.sum`.
-
-### Configure the local connection
-
-In the same PowerShell session, enter the password for `url_shortener_dev` without putting it in command history:
-
-```powershell
-$databasePassword = Read-Host 'Password for url_shortener_dev' -AsSecureString
-$databaseCredential = [System.Net.NetworkCredential]::new('', $databasePassword)
-$encodedDatabasePassword = [Uri]::EscapeDataString($databaseCredential.Password)
-
-$localDatabaseURL = "postgres://url_shortener_dev:${encodedDatabasePassword}@localhost:5432/url_shortener?sslmode=disable"
-```
-
-URL encoding handles password characters such as `@`. The connection URL contains credentials. Do not print the connection URL. Do not commit it to Git. Do not share it.
-
-`sslmode=disable` disables encryption. Use this setting only for the local development connection. Set the variables again in each new terminal.
-
-### Apply and inspect migrations
-
-From the project root:
-
-```powershell
-& (Join-Path $migrationBin 'migrate.exe') -path './migrations' -database $localDatabaseURL up
-& (Join-Path $migrationBin 'migrate.exe') -path './migrations' -database $localDatabaseURL version
-```
-
-The migration runner should report version `2` without a dirty indication. If both migrations are applied, `up` reports `no change`. Run migrations separately. Server startup does not apply migrations.
-
-Connect to inspect the schema:
-
-```powershell
-& 'C:\Program Files\PostgreSQL\18\bin\psql.exe' -h localhost -p 5432 -U url_shortener_dev -d url_shortener -W
-```
-
-At the `psql` prompt:
-
-```text
-\d urls
-\d public.url_daily_clicks
-```
-
-```sql
-SELECT version, dirty FROM schema_migrations;
-```
-
-The `urls` table has an identity primary key and a unique `code`. Check constraints reject empty codes and destination URLs. The creation timestamp has a default value. The expiry timestamp can be null.
-
-Both timestamps use `TIMESTAMPTZ` (`timestamp with time zone`). The session timezone controls their displayed values. The timestamps identify instants. A null expiry means that the link has no expiry. Expiry uses the column from migration 1. Analytics use the separate table from migration 2.
-
-Migration 2 creates `public.url_daily_clicks`. Each row contains `url_id`, `click_date`, and a positive `click_count`. The primary key is `(url_id, click_date)`. A foreign key references `public.urls(id)`. URL deletion also removes its daily counts through `ON DELETE CASCADE`.
-
-Existing URLs require no counter rows until their first counted request. The application converts event times to UTC before extracting dates. The database DATE type contains no timezone.
-
-The migration runner reverses migrations in descending order. Migration 2 rollback removes analytics, but leaves URL records. Migration 1 rollback removes the URL table and its records. Reapplying migrations restores structure, not deleted data.
-
-Before you repair a dirty migration, inspect the actual schema. The `force` command changes version metadata without SQL execution. In this runner, `-1` means that no migration is applied. The negative argument requires `force -- -1`. Use this command only for recovery, not for normal setup.
-
-### Start with PostgreSQL
-
-After leaving `psql`, in the configured PowerShell session:
-
-```powershell
-$env:STORAGE_BACKEND = 'postgres'
-$env:DATABASE_URL = $localDatabaseURL
-go run ./cmd/server
-```
-
-Startup creates a shared pgx pool. It checks connectivity with a five-second context. If configuration or connectivity fails, startup returns an error. The server does not select memory storage instead. On normal shutdown, the pool closes after HTTP shutdown.
-
-## Redis caching setup
-
-### Start local Redis
-
-Open Docker Desktop and wait for its engine to start. In PowerShell:
-
-```powershell
-docker info --format '{{.OSType}}'
-```
-
-Expect `linux`. For first-time setup, create the container:
-
-```powershell
-docker run --detach --name url-shortener-redis --publish 127.0.0.1:6379:6379 redis:8
-```
-
-For an already-created container, use this instead of repeating `docker run`:
-
-```powershell
-docker start url-shortener-redis
-```
-
-Check Redis with the client included inside the container:
-
-```powershell
-docker exec url-shortener-redis redis-cli ping
-```
-
-Expect `PONG`. The port mapping exposes Redis only on the Windows loopback address. You do not need a separate Windows `redis-cli` installation.
-
-The container ping checks Redis inside the container. The Go integration test checks access through the host port.
-
-### Enable caching in the Go server
-
-In the same terminal containing the PostgreSQL connection setup:
-
-```powershell
-$env:STORAGE_BACKEND = 'postgres'
-$env:DATABASE_URL = $localDatabaseURL
-$env:REDIS_URL = 'redis://127.0.0.1:6379/0'
-go run ./cmd/server
-```
-
-To enable deletion and statistics, configure `MANAGEMENT_API_KEY` in the server terminal before startup. Expect `Redis lookup caching configured`, then the server startup message. After configuration changes, restart the Go server.
-
-The Redis client does not send a startup PING. Thus, the configuration message does not prove connectivity. Invalid Redis URL configuration stops startup. If Redis is unavailable during lookup, the server queries PostgreSQL.
-
-To disable caching, set `REDIS_URL` to an empty string. Then restart the server. A Redis URL in memory mode stops startup.
-
-### Cache policy
-
-PostgreSQL is the primary storage. Creation writes directly to PostgreSQL. It does not read or write Redis. Metadata and redirect lookups use this sequence:
-
-```text
-Redis hit -> return cached record
-Redis miss, read error, or invalid cached data -> query PostgreSQL
-    database error -> preserve the error; do not cache it
-    record found -> calculate TTL -> populate Redis when TTL is positive
-```
-
-The wrapper logs cache-write failures. It still returns a record retrieved from primary storage. Parent-request cancellation stops processing. A Redis timeout permits a PostgreSQL query if the parent context is active. The cache does not store missing-record results.
-
-Redis stores URL records, including their database IDs. It does not store analytics counters. A cache hit avoids the URL lookup query. Each counted GET still writes to primary storage before the redirect. Statistics bypass Redis for both URL lookup and counter reads.
-
-- The maximum cache time to live (TTL) is five minutes. Startup configuration sets this value.
-- An expiring link uses the smaller of that maximum and its remaining lifetime when the TTL is calculated.
-- TTLs are rounded down to milliseconds. Zero, negative, expired, and sub-millisecond results skip insertion rather than create a permanent key.
-- Cache hits do not refresh TTLs; this is fixed TTL from insertion, not sliding expiry.
-- Cached JSON includes the record's expiry. Metadata and redirect handlers check the actual deadline and return 410 when expired.
-- An expired primary record can be returned for HTTP classification, but is not repopulated into Redis.
-
-Each Redis operation in the wrapper has a 200 ms context limit. The client also has one-second connection, read, and write timeouts. It respects context deadlines and disables automatic command retries.
-
-These separate limits do not guarantee a complete HTTP response within 200 ms. Pool waits, primary queries, and locks can add time.
-
-### Namespaces and deletion consistency
-
-Startup generates a fresh random namespace with `crypto/rand.Text`. Application keys have this form:
-
-```text
-url-shortener:v1:url:<run-namespace>:<code>
-```
-
-The namespace does not change short URLs. Each server run uses a new namespace and starts with an empty usable cache. It ignores entries from earlier runs. Old entries expire through their TTLs. Startup does not clear Redis.
-
-Some adapter tests use an empty namespace. Application startup always supplies a namespace.
-
-The wrapper holds a read lock during lookup and cache population. Deletion takes the write lock. It removes the Redis entry before primary deletion. This sequence prevents an active lookup from restoring the deleted mapping through the same wrapper.
-
-If cache invalidation fails, the API returns 500. It does not attempt primary deletion. Reads can still query PostgreSQL during the Redis outage.
-
-If primary deletion fails after invalidation, the cache remains empty. The next lookup checks the actual primary state. Removal of an absent Redis key succeeds.
-
-This policy requires one Go server process and writes through its handlers. The lock does not coordinate separate processes. A run namespace does not invalidate entries in another active process.
-
-Multiple servers and direct database writes require additional coordination. Concurrent cache misses can cause repeated primary queries. The server does not combine these requests to prevent a cache stampede.
-
-## Endpoints
-
-| Method | Path | Successful response |
+| Service | Address on Windows | Address inside Compose |
 | --- | --- | --- |
-| POST | `/api/v1/urls` | 201 with `code`, `url`, `short_url`, and optional `expires_at` as JSON |
-| GET | `/api/v1/urls/{code}` | 200 with `code`, `url`, and optional `expires_at` as JSON for an active link |
-| GET | `/api/v1/urls/{code}/stats` | 200 with `code`, `total_clicks`, and `daily`; requires management authentication |
-| GET | `/{code}` | 302 with the destination in the `Location` header |
-| DELETE | `/api/v1/urls/{code}` | 204 with no body; requires configured management authentication |
-| GET | `/healthz` | 200 with `OK` |
-| GET | `/readyz` | 200 with `OK` when primary storage is ready; otherwise 503 with `not ready` |
-| GET | `/` | 200 with `Hello, Go!` |
+| Application | `127.0.0.1:8080` | `app:8080` |
+| PostgreSQL | `127.0.0.1:5433` | `postgres:5432` |
+| Redis | `127.0.0.1:6380` | `redis:6379` |
 
-Unknown codes return 404. Expired metadata and redirect requests return 410 without a redirect destination. Successful create and metadata responses have `Content-Type: application/json`. Error responses contain plain text. Successful deletion has no body. Go GET route patterns also accept HEAD requests.
+Use service names inside containers. Use published ports for host tools.
 
-GET redirects record clicks before returning 302. HEAD redirects return the destination header without a body or click increment. Statistics remain available for expired records until deletion. Successful statistics responses contain JSON and `Cache-Control: no-store`.
+## API examples
 
-`ServeMux` selects the most specific matching pattern. The health route has priority over `/{code}`. The wildcard captures one path segment. The root pattern, `GET /{$}`, matches only `/`.
+These examples use the stack from Quick start.
 
-The health endpoint checks whether the HTTP server can respond. It does not check PostgreSQL. Readiness calls PostgreSQL `pool.Ping` with a one-second child context. In memory mode, readiness succeeds immediately.
+### Create a short link
 
-Readiness checks connectivity, not the `urls` schema. It does not check Redis. Reads can use PostgreSQL during Redis outages, but deletion can fail. Readiness responses include `Cache-Control: no-store`.
-
-## Create, inspect, and follow a short link
-
-Run these commands in a second PowerShell terminal while the server is running:
-
-```powershell
-$response = Invoke-WebRequest -Uri 'http://127.0.0.1:8080/api/v1/urls' -Method Post -ContentType 'application/json' -Body '{"url":"https://example.com/articles/go"}'
-$link = $response.Content | ConvertFrom-Json
-$response.StatusCode
-$link
-```
-
-Expect status 201 and a response resembling:
-
-```json
-{"code":"Ab12Cd34","url":"https://example.com/articles/go","short_url":"http://127.0.0.1:8080/Ab12Cd34"}
-```
-
-The code varies with each creation. Inspect the saved metadata:
-
-```powershell
-curl.exe -i "http://127.0.0.1:8080/api/v1/urls/$($link.code)"
-```
-
-Expect status 200 with the generated code and original URL. Inspect the redirect:
-
-```powershell
-curl.exe -i $link.short_url
-```
-
-Expect status 302 and `Location: https://example.com/articles/go`. Curl does not follow the redirect unless you add `-L`. The shortener itself does not fetch the destination.
-
-Check a missing record and the basic endpoints:
-
-```powershell
-curl.exe -i http://127.0.0.1:8080/api/v1/urls/missing
-curl.exe -i http://127.0.0.1:8080/missing
-curl.exe -i http://127.0.0.1:8080/healthz
-curl.exe -i http://127.0.0.1:8080/
-```
-
-Expect two 404 responses, followed by two 200 responses. The health body contains `OK`. The root body contains the greeting.
-
-In memory mode, create a new link after each restart. PostgreSQL links remain available when the server connects to the same database.
-
-## Custom aliases and expiry
-
-Creation accepts optional `alias` and `expires_at` fields alongside the required destination URL:
-
-| Field | Omitted or null | Supplied value |
-| --- | --- | --- |
-| `alias` | Generate a random code | Use the exact validated alias; an empty string is invalid |
-| `expires_at` | No expiry | RFC 3339 timestamp with timezone, such as `2030-01-01T12:00:00Z` |
-
-Aliases must contain 3 to 32 ASCII letters, digits, hyphens, or underscores. The stored alias keeps its capitalization. Aliases are case-sensitive in the tested storage setup. The reserved names are `healthz`, `readyz`, and `api`, regardless of capitalization.
-
-The validator does not remove whitespace. Custom aliases and generated codes share one namespace. Before readiness registration, the developer checked for existing `readyz` aliases without a case distinction. No matching records existed. Validation does not change existing records.
-
-An occupied alias returns 409. The server keeps the existing mapping and does not generate a random code instead. Alias creation makes one save attempt. Random allocation permits five attempts.
-
-Expiry specifies an absolute deadline. It is not a TTL duration. Both creation paths copy the supplied timestamp. They convert the copy to UTC and truncate it to microsecond precision. The result must be later than the current time.
-
-Malformed timestamps fail JSON decoding. Valid timestamps in the past fail service validation. Both failures return 400. Creation returns the normalized UTC deadline. Metadata returns the same instant, possibly with a different timezone offset after storage.
-
-If a link has no expiry, the response omits `expires_at`. It does not return null for that field.
-
-A link expires at its deadline. It remains expired after that instant. Metadata and redirects return 410 for expired links. Expiry does not remove the record or release its code. A new request for the same alias still conflicts.
-
-### Try the lifecycle over HTTP
-
-With the server running, create a uniquely named alias that expires in two minutes:
-
-```powershell
-$deadline = [DateTimeOffset]::UtcNow.AddMinutes(2)
-$payload = @{
-    url = 'https://example.com/expiry-demo'
-    alias = "expiry-$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
-    expires_at = $deadline.ToString('o')
-} | ConvertTo-Json -Compress
-
-$response = Invoke-WebRequest -Uri 'http://127.0.0.1:8080/api/v1/urls' -Method Post -ContentType 'application/json' -Body $payload
-$lifecycleLink = $response.Content | ConvertFrom-Json
-$lifecycleURL = "http://127.0.0.1:8080/api/v1/urls/$($lifecycleLink.code)"
-$response.StatusCode
-$response.Content
-```
-
-Expect 201 with the alias and normalized expiry. Before the deadline:
-
-```powershell
-curl.exe -i $lifecycleURL
-curl.exe -i $lifecycleLink.short_url
-```
-
-Expect 200 with metadata and 302 with the destination. After the returned expiry passes, repeat the same requests; both should return 410.
-
-Attempt alias reuse without an expiry:
-
-```powershell
-$reusePayload = @{
-    url = 'https://example.com/replacement'
-    alias = $lifecycleLink.code
-} | ConvertTo-Json -Compress
-
-$reusePayload | curl.exe -i -H 'Content-Type: application/json' --data-binary '@-' http://127.0.0.1:8080/api/v1/urls
-```
-
-Expect 409. If you resend the original payload after its deadline, expect 400. Expiry validation occurs before the save attempt and alias-conflict check.
-
-## Redirect analytics
-
-### Counting policy
-
-The server records valid GET redirect requests. It checks lookup and expiry before recording. It records the event before sending 302. The expiry check and event use the same captured timestamp.
-
-- Repeated GET requests each add one click.
-- HEAD, metadata, statistics, health, and readiness requests add no clicks.
-- Missing and expired redirect requests add no clicks.
-- Recording failure returns the mapped error without a `Location` header.
-- Statistics remain available for expired records until deletion.
-
-A count does not prove that the client received or followed the redirect. It does not identify a unique visitor. A client disconnect can occur after recording. A retry can add another count. A database timeout can leave the commit outcome unknown.
-
-The application stores daily aggregates. It does not store individual click events, raw IP addresses, or user-agent strings for analytics.
-
-### Record identity and UTC dates
-
-Analytics belong to a stored record ID. Short codes can be reused after deletion. A replacement receives a different ID and starts with zero clicks. An event for the old ID returns `errURLNotFound`.
-
-Memory storage assigns IDs under its write lock. The counter remains unchanged during deletion. PostgreSQL supplies IDs through its identity column. Lookup returns the stored ID. Redis serialization preserves that ID.
-
-Each daily counter uses a UTC date in `YYYY-MM-DD` format. Equivalent instants use the same date regardless of their supplied timezone offset. Results contain only dates with clicks, sorted from earliest to latest. The total equals the sum of these daily counts.
-
-Memory storage keeps counters under the same lock as URL records. PostgreSQL uses one `INSERT ... ON CONFLICT DO UPDATE` statement per click. The statement increments the stored value instead of reading it into Go first.
-
-The statistics reader uses one ordered query with a left join. An existing URL without clicks returns total zero and an empty daily slice. A missing ID returns `errURLNotFound`. Row-iteration errors remain storage errors.
-
-### Synchronous writes and availability
-
-Recording uses primary storage directly. Redirect lookup can use Redis. Statistics bypass Redis for URL lookup and count retrieval. There is no background queue, replay process, or analytics flush during shutdown.
-
-In PostgreSQL mode, each counted GET needs a database write, including cache hits. This adds work compared with lookup-only redirects. Its performance cost has not been measured.
-
-| Condition | GET redirect | HEAD redirect | Metadata | Statistics |
-| --- | --- | --- | --- | --- |
-| Dependencies available, active URL | 302 after recording | 302 without recording | 200 | 200 with credentials |
-| Redis unavailable, PostgreSQL available | PostgreSQL lookup and recording; 302 | PostgreSQL lookup; 302 | 200 | 200 with credentials |
-| PostgreSQL unavailable, active URL cached | 500 or 503; no redirect destination | 302 while the cache entry remains usable | 200 while cached | 500 or 503 with credentials |
-| PostgreSQL unavailable, URL not cached | 500 or 503 | 500 or 503 | 500 or 503 | 500 or 503 with credentials |
-
-Unexpected storage failures map to 500. Reported deadline errors map to 503. A record deleted between lookup and recording maps to 404. Statistics authentication runs before lookup, so invalid credentials return 401 even during database outages.
-
-Memory analytics disappear with the store on process exit. PostgreSQL analytics survive Go restarts and remain after database recovery. Deletion removes the record and its counters. Redis outage behavior for deletion remains unchanged: invalidation must succeed before primary deletion.
-
-### Inspect statistics over HTTP
-
-Configure the server key with the [management-key procedure](#enable-deletion). Keep PostgreSQL at migration version 2 when using that backend.
-
-In a request terminal, create a fresh link:
-
-```powershell
+~~~powershell
 $response = Invoke-WebRequest `
     -Uri 'http://127.0.0.1:8080/api/v1/urls' `
     -Method Post `
     -ContentType 'application/json' `
-    -Body '{"url":"https://example.com/analytics-check"}'
+    -Body '{"url":"https://example.com/articles/go"}'
 
-$analyticsLink = $response.Content | ConvertFrom-Json
-$metadataURL = "http://127.0.0.1:8080/api/v1/urls/$($analyticsLink.code)"
-$statsURL = "$metadataURL/stats"
-```
+$link = $response.Content | ConvertFrom-Json
+$link
+~~~
 
-Enter the same key as the server:
+The response status is `201 Created`. Example response:
 
-```powershell
-$clientKeyInput = Read-Host 'Management API key' -AsSecureString
-$clientKey = [System.Net.NetworkCredential]::new('', $clientKeyInput).Password
-```
-
-Check authorization and initial statistics:
-
-```powershell
-curl.exe -i $statsURL
-curl.exe -i -H 'Authorization: Bearer wrong-key' $statsURL
-curl.exe -i -H "Authorization: Bearer $clientKey" $statsURL
-```
-
-Expect 401, 401, and 200. The authorized response contains total zero and `"daily":[]`. Startup omits the statistics route if the management key is empty. That route then returns 404.
-
-Send three GET requests without following redirects:
-
-```powershell
-1..3 | ForEach-Object {
-    curl.exe -sS -o NUL -w "%{http_code}\n" $analyticsLink.short_url
+~~~json
+{
+  "code": "abc12345",
+  "url": "https://example.com/articles/go",
+  "short_url": "http://127.0.0.1:8080/abc12345"
 }
-```
+~~~
 
-Expect three 302 responses. The `-sS` options suppress progress output but retain error messages. Curl status `000` means no HTTP status was received. It is not a server response code.
+Create a link with a custom alias and expiry:
 
-Send HEAD and metadata requests:
+~~~powershell
+$payload = @{
+    url = 'https://example.com/guide'
+    alias = 'go-guide'
+    expires_at = [DateTimeOffset]::UtcNow.AddHours(1).ToString('o')
+} | ConvertTo-Json -Compress
 
-```powershell
-curl.exe -I $analyticsLink.short_url
+Invoke-WebRequest `
+    -Uri 'http://127.0.0.1:8080/api/v1/urls' `
+    -Method Post `
+    -ContentType 'application/json' `
+    -Body $payload
+~~~
+
+An occupied alias returns `409 Conflict`. Create a new future deadline when you repeat an expiring request.
+
+### Read metadata and follow the redirect
+
+~~~powershell
+$metadataURL = "http://127.0.0.1:8080/api/v1/urls/$($link.code)"
 curl.exe -i $metadataURL
-curl.exe -i -H "Authorization: Bearer $clientKey" $statsURL
-```
+curl.exe -i $link.short_url
+~~~
 
-Expect 302, 200, and 200. The total remains three. If all GET requests occurred on one UTC date, the statistics resemble:
+Metadata returns `200 OK` with `code`, `url`, and optional `expires_at`.
 
-```json
-{"code":"Ab12Cd34","total_clicks":3,"daily":[{"date":"2026-11-01","clicks":3}]}
-```
+A GET redirect returns `302 Found` with the destination in `Location`. The command above does not follow that destination.
 
-The code and date depend on the requests. Requests across UTC midnight can produce two daily entries. Daily counts must still sum to three. Statistics responses include `Cache-Control: no-store`.
+Use HEAD to inspect redirect headers without recording a click:
 
-## Protected deletion
+~~~powershell
+curl.exe --head $link.short_url
+~~~
 
-Deletion permanently removes an active or expired mapping. It releases the code for reuse. Success returns 204 with an empty body. A missing code returns 404 if the required storage and cache operations succeed. A repeated deletion also returns 404.
+### Read statistics
 
-After deletion, metadata and redirect requests return 404. With caching enabled, Redis invalidation must succeed before primary deletion. If invalidation fails, the API returns 500. The primary record remains.
-
-Deletion also removes the record's analytics. Statistics then return 404. Reusing the code creates a different record ID with zero clicks.
-
-Startup registers the DELETE route only if `MANAGEMENT_API_KEY` is not empty. Without this configuration, DELETE on the metadata path returns 405. With this configuration, missing or invalid credentials return 401 with `WWW-Authenticate: Bearer`. The protected handler does not execute.
-
-One shared management key protects deletion and statistics. Any holder can delete any link or read its statistics. The server does not assign links to individual users. Creation, metadata, redirects, health, and readiness remain public.
-
-The middleware compares fixed-length SHA-256 hashes with `crypto/subtle.ConstantTimeCompare`. It does not log credentials.
-
-### Enable deletion
-
-Choose and privately retain a long random management key, separate from the database password. In the server terminal, enter it at a hidden prompt before starting or restarting Go:
-
-```powershell
-$managementKeyInput = Read-Host 'Management API key' -AsSecureString
-$env:MANAGEMENT_API_KEY = [System.Net.NetworkCredential]::new('', $managementKeyInput).Password
-go run ./cmd/server
-```
-
-Keep the storage configuration in the server terminal. The server reads the management key only at startup. Do not put the key in source code, command text, logs, or shared output.
-
-The current listener uses local HTTP. Before network use, protect bearer credentials with HTTPS.
-
-### Verify unauthorized and authorized deletion
-
-In a second terminal, create a disposable link:
-
-```powershell
-$response = Invoke-WebRequest -Uri 'http://127.0.0.1:8080/api/v1/urls' -Method Post -ContentType 'application/json' -Body '{"url":"https://example.com/delete-check"}'
-$deleteLink = $response.Content | ConvertFrom-Json
-$deleteURL = "http://127.0.0.1:8080/api/v1/urls/$($deleteLink.code)"
-
-curl.exe -i -X DELETE $deleteURL
-curl.exe -i $deleteURL
-```
-
-Expect 401 followed by 200, proving the unauthorized request preserved the record. Enter the same key used by the server:
-
-```powershell
-$clientKeyInput = Read-Host 'Management API key' -AsSecureString
-$clientKey = [System.Net.NetworkCredential]::new('', $clientKeyInput).Password
-$managementHeaders = @{ Authorization = "Bearer $clientKey" }
-
-$result = Invoke-WebRequest -Uri $deleteURL -Method Delete -Headers $managementHeaders
-$result.StatusCode
-$result.Content
-
-curl.exe -i $deleteURL
-curl.exe -i $deleteLink.short_url
-```
-
-Expect 204 with an empty body. Then expect 404 from both lookups. Client and server terminals have separate variables. A client key does not configure a server that is already running. During debugging, share status codes instead of credentials.
-
-## Input rules and failure responses
-
-Creation accepts one JSON object with a string field named `url` and optional `alias` and `expires_at` fields:
-
-- The entire body is limited to 4 KiB (4096 bytes), including trailing whitespace.
-- Malformed JSON, unknown fields, incorrect field types, and additional JSON values are rejected.
-- The URL must parse successfully, use `http` or `https`, and contain a nonempty hostname.
-- Empty or missing URLs, relative paths, and unsupported schemes are rejected.
-- Validation checks URL structure without contacting the destination; it does not establish destination availability or safety.
-- Supplied alias and expiry values must meet the lifecycle rules above; invalid input is rejected before saving.
-
-| Status | Meaning |
-| --- | --- |
-| 400 | Invalid JSON body, destination URL, alias, or expiry |
-| 401 | Missing or invalid credentials for a configured management route |
-| 404 | Unknown short code |
-| 405 | Method not registered, including DELETE when management deletion is disabled |
-| 409 | Requested custom alias is already occupied |
-| 410 | Existing link has expired; applies to metadata and redirect access |
-| 413 | Request body exceeds the size limit |
-| 500 | Code generation, database access, required deletion invalidation, or another unexpected internal operation fails |
-| 429 | Creation attempts exceed the shared per-process limit |
-| 503 | All five code-allocation attempts collide, downstream work reports `context.DeadlineExceeded`, or the readiness check fails |
-
-The decoder does not enforce the request Content-Type. Send `application/json` as shown in the examples.
-
-## Security and operational safeguards
-
-### Request IDs and structured logs
-
-The server generates a new request ID with `crypto/rand.Text`. It replaces a client-supplied `X-Request-ID`. The response header and request context contain the generated ID. Use the ID to correlate requests and logs. It does not grant authorization.
-
-Router-generated responses also receive IDs. Incomplete headers fail before handler execution. Those requests do not pass through the middleware.
-
-The middleware order is:
-
-```text
-Request ID -> five-second request context -> request logging -> ServeMux
-```
-
-Logging runs inside the timeout wrapper. Thus, logging reads the request whose `Pattern` the mux sets. Completed requests produce JSON logs through `log/slog` on standard output. Each log contains `request_id`, `method`, `route`, and `duration_ms`.
-
-Unmatched routes have an empty pattern. Very fast requests can have zero duration. The logger records route patterns, not raw URLs, query strings, bodies, or authorization headers. It does not record response status or byte counts. If downstream code panics, the completion log does not execute.
-
-Startup, normal shutdown, Redis cleanup warnings, and top-level failures also use structured logging. Response-helper and cache-wrapper diagnostics still use the standard `log` package. Some diagnostic logs are not JSON and have no request ID.
-
-### Creation rate limit
-
-The creation limit permits ten attempts per one-minute window. All clients share this limit within one server process. The limiter runs before JSON decoding, validation, and storage. Invalid input also uses capacity.
-
-Excess attempts return 429 with `creation rate limit exceeded`. These responses include `Cache-Control: no-store`. The create handler does not execute. The response has no `Retry-After` header.
-
-The first window starts when the server constructs the limiter. After that window expires, the next attempt starts a new window. One mutex protects the limit check and counter increment. Other endpoints do not use this limit.
-
-A server restart resets the limiter. Separate processes have separate limits. Requests near a window boundary can exceed ten within a rolling minute. The limiter does not distinguish individual clients.
-
-To repeat the burst check with a fresh server and no earlier creation attempts:
-
-```powershell
-1..11 | ForEach-Object {
-    curl.exe -s -o NUL -w "%{http_code}\n" `
-        -H 'Content-Type: application/json' `
-        --data-binary '{}' `
-        http://127.0.0.1:8080/api/v1/urls
+~~~powershell
+$managementHeaders = @{
+    Authorization = "Bearer $env:MANAGEMENT_API_KEY"
 }
-```
+$statsURL = "$metadataURL/stats"
 
-Expect ten 400 responses followed by 429 when all attempts occur in the same window. The empty payload reaches validation but creates no record. After the window expires, another identical attempt returns 400 again. Health and readiness remain available throughout.
+Invoke-RestMethod -Uri $statsURL -Headers $managementHeaders
+~~~
 
-### URL safety and secrets
+Example response after one GET redirect:
 
-The validator accepts absolute HTTP and HTTPS destinations with a hostname. It also accepts localhost and private-network addresses. This policy checks URL structure. It does not establish destination safety, ownership, or availability.
+~~~json
+{
+  "code": "abc12345",
+  "total_clicks": 1,
+  "daily": [
+    {
+      "date": "2026-11-01",
+      "clicks": 1
+    }
+  ]
+}
+~~~
 
-The server sends a redirect. It does not fetch the destination. URL previews and availability checks would introduce server-side request forgery (SSRF) risks. Such features require a separate design for DNS checks, redirects, and other SSRF defenses.
+Statistics use UTC dates. A link with no clicks returns `"daily":[]`.
 
-Configuration uses process environment variables. The examples use hidden prompts for secret input. Do not commit or share database URLs, Redis credentials, or management keys. Do not log credentials.
+### Delete a link
 
-Hidden prompts keep typed secrets out of command history. The process environment still contains plaintext credentials. The application has no integrated secret manager. A shared management key protects deletion and statistics. The listener accepts only local connections.
+~~~powershell
+$result = Invoke-WebRequest `
+    -Uri $metadataURL `
+    -Method Delete `
+    -Headers $managementHeaders
 
-Shared deployment and TLS configuration are future work.
+$result.StatusCode
+~~~
 
-### Readiness outage and recovery
+Successful deletion returns `204 No Content`. Later metadata, redirect, and statistics requests return `404 Not Found`.
 
-With PostgreSQL selected and Go left running, compare:
+Deletion removes the associated counters. A new record can reuse the code, but it receives a new ID and starts with zero clicks.
 
-```powershell
-curl.exe --max-time 5 -i http://127.0.0.1:8080/readyz
-curl.exe --max-time 5 -i http://127.0.0.1:8080/healthz
-```
+## API reference
 
-The developer stopped PostgreSQL while the Go server remained running. Readiness returned 503. Health continued to return 200. After PostgreSQL restarted, readiness returned 200 without a Go restart.
+| Method | Route | Purpose | Success | Authentication |
+| --- | --- | --- | --- | --- |
+| POST | `/api/v1/urls` | Create a link | 201 | Public |
+| GET | `/api/v1/urls/{code}` | Read active-link metadata | 200 | Public |
+| GET | `/{code}` | Record a click and redirect | 302 | Public |
+| HEAD | `/{code}` | Return redirect headers without a click | 302 | Public |
+| GET | `/api/v1/urls/{code}/stats` | Read total and daily counts | 200 | Bearer key |
+| DELETE | `/api/v1/urls/{code}` | Delete a link and its counters | 204 | Bearer key |
+| GET | `/healthz` | Check that the HTTP process responds | 200 | Public |
+| GET | `/readyz` | Check primary-storage connectivity | 200 | Public |
+| GET | `/` | Return a basic greeting | 200 | Public |
 
-The readiness failure body contains `not ready`. It does not contain the internal database error. To repeat this check, use the service commands below.
+Management routes are registered only when `MANAGEMENT_API_KEY` is nonempty. Missing or invalid credentials return `401` when those routes are enabled.
 
-## Storage and code generation
+### Creation rules
 
-Startup selects one repository for all handlers. Memory storage uses a map with `sync.RWMutex` protection. Duplicate detection and insertion share one write lock. A competing creation request cannot overwrite an existing mapping.
+- `url` must be an absolute HTTP or HTTPS URL with a hostname.
+- The body limit is 4 KiB, including trailing whitespace.
+- The body must contain one JSON value. Unknown fields are rejected.
+- Omit `alias`, or set it to `null`, to generate a random code.
+- Custom aliases accept 3–32 ASCII letters, digits, hyphens, or underscores.
+- Alias case is preserved. Reserved names are `healthz`, `readyz`, and `api`, compared without case.
+- An explicitly empty alias is invalid.
+- `expires_at` must be an RFC3339 timestamp with a timezone and a future deadline.
+- Omitted or null expiry creates a permanent link.
+- Expiry is normalized to UTC and microsecond precision before storage.
 
-PostgreSQL storage uses a shared `pgxpool.Pool` and parameterized SQL. The `urls_code_unique` constraint enforces code uniqueness across requests and processes. Only SQLSTATE `23505` for this constraint becomes `errCodeExists`.
+At the exact expiry deadline, the link is expired. Expiry prevents redirects and metadata access. It does not remove the record or release its code.
 
-The repository translates `pgx.ErrNoRows` into `errURLNotFound`. Deletion checks `RowsAffected()` to detect an absent record. A DELETE with no matching rows is valid SQL, but the API reports a missing record. Other database errors retain their identity through wrapping.
+Statistics and deletion remain available for expired records.
 
-The nullable `expires_at` column stores optional expiry. Repository lookup returns expired records. Metadata and redirect handlers apply the 410 policy. Deletion can remove expired records.
+### Failure responses
 
-Codes use six random bytes from `crypto/rand`, encoded as eight URL-safe Base64 characters without padding. Randomness does not guarantee uniqueness. Creation retries with a new code after a collision, up to five attempts total.
-
-The create-handler factory receives a repository and a generator function. It constructs one service for subsequent requests. The service allocates codes and saves records. Tests use controlled generators to produce collisions and allocation failure. Production uses the random generator.
-
-A record is saved before the create response is written. If response writing fails, the record can exist even though the client did not receive confirmation.
-
-## Application structure
-
-The code remains in the `cmd/server` package. Each file has a specific responsibility. Add packages only when necessary.
-
-| File | Responsibility |
+| Status | Condition |
 | --- | --- |
-| `main.go` | Select storage from environment configuration, register routes, and manage server startup and shutdown |
-| `repository.go` | Define `urlRepository`, narrow `urlDeleter`, and composed `urlStore`; check both implementations |
-| `store.go` | Define URL records and implement concurrency-safe in-memory storage |
-| `database.go` | Create a pgx pool and verify connectivity with a bounded ping |
-| `postgres_store.go` | Implement PostgreSQL saves, lookups, expiry persistence, and deletion with error translation |
-| `cache.go` | Define the `urlCache` interface and cache-miss error |
-| `cache_ttl.go` | Calculate finite, expiry-aware TTLs at millisecond precision |
-| `redis_client.go` | Parse Redis connection configuration and configure network timeouts and command retries |
-| `redis_cache.go` | Encode/decode records, construct namespaced keys, and implement Redis get/set/delete |
-| `cached_store.go` | Add cache-aside lookup, primary-only saves, and coordinated invalidation/deletion |
-| `service.go` | Validate destinations, aliases, and expiry; allocate random or custom codes and save records |
-| `create_handler.go` | Decode create requests, call the service, and build HTTP responses |
-| `metadata_handler.go` | Look up records and return metadata as JSON |
-| `redirect_handler.go` | Look up records, check expiry, record GET clicks, and return redirects |
-| `analytics.go` | Define UTC dates, daily counts, and narrow analytics interfaces |
-| `memory_analytics.go` | Increment and read daily counts under the memory-store lock |
-| `postgres_analytics.go` | Increment counts atomically and read ordered daily statistics |
-| `statistics_handler.go` | Read primary statistics and return the JSON response |
-| `delete_handler.go` | Delete a record through `urlDeleter` and return 204 or a mapped error |
-| `auth.go` | Validate management credentials before calling the protected handler |
-| `request_id.go` | Generate response request IDs and propagate them through context |
-| `request_logging.go` | Log completed requests with IDs, methods, route patterns, and durations |
-| `request_timeout.go` | Derive and clean up a request-scoped timeout context |
-| `readiness_handler.go` | Run an injected primary-storage check with a one-second timeout |
-| `create_limiter.go` | Enforce a mutex-protected fixed-window creation limit |
-| `create_rate_limit.go` | Reject excess creation attempts before the protected handler executes |
-| `alias.go` | Enforce custom-alias characters, length, and reserved names |
-| `expiry.go` | Normalize and validate deadlines and check exact expiry boundaries |
-| `request.go` | Decode one JSON request with a body-size limit and unknown-field rejection |
-| `response.go` | Write JSON responses and map service errors to HTTP errors |
-| `validation.go` | Enforce the destination URL policy |
-| `code.go` | Generate random, URL-safe short codes |
-| `migrations/001_create_urls.*.sql` (project root) | Define schema creation and its rollback |
-| `migrations/002_create_url_daily_clicks.*.sql` (project root) | Define daily counters, constraints, cascade deletion, and rollback |
+| 400 | Invalid JSON, URL, alias, or expiry |
+| 401 | Missing or invalid management credentials |
+| 404 | Record missing or path not registered |
+| 409 | Custom alias already occupied |
+| 410 | Link expired |
+| 413 | Creation body exceeds the size limit |
+| 429 | Creation rate limit exceeded |
+| 500 | Unexpected storage or internal failure |
+| 503 | Allocation attempts exhausted, reported request deadline exceeded, or readiness check failed |
 
-Creation follows this flow:
+Successful data responses use JSON. Error responses use plain text. Internal error details are logged instead of returned to clients.
 
-```text
-HTTP request -> decoder -> service -> repository
-                             |
-                       code generator
+## Configuration
 
-Service result or error -> HTTP handler -> response helper -> HTTP response
-```
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HTTP_ADDR` | `127.0.0.1:8080` | HTTP listening address |
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8080` | Public origin used in returned short links |
+| `STORAGE_BACKEND` | `memory` | Select `memory` or `postgres` |
+| `DATABASE_URL` | Unset | PostgreSQL connection URL |
+| `REDIS_URL` | Unset | Enable Redis lookup caching in PostgreSQL mode |
+| `MANAGEMENT_API_KEY` | Unset | Enable protected deletion and statistics |
+| `TEST_DATABASE_URL` | Unset | Enable PostgreSQL integration tests |
+| `TEST_REDIS_URL` | Unset | Enable Redis integration tests |
 
-Handlers depend on `urlRepository`, rather than the map implementation. Go checks interface satisfaction implicitly from matching method signatures. Tests can therefore substitute a fake repository to exercise storage failures.
+The Docker image sets `HTTP_ADDR=0.0.0.0:8080`. Compose supplies PostgreSQL and Redis connection URLs.
 
-All storage operations accept `context.Context`. Creation passes `r.Context()` through the service to storage. Metadata, redirects, and deletion also pass the request context to storage.
+`PUBLIC_BASE_URL` must use HTTP or HTTPS and include a hostname. Credentials, queries, fragments, and path prefixes are rejected. A trailing slash is removed.
 
-Lookup returns `(urlRecord, error)`. The error distinguishes absent records, cancellation, and storage failures. The delete handler needs only `urlDeleter`. Startup selects the composed `urlStore` interface.
+Set the public origin separately from the listen address when a reverse proxy provides HTTPS. Creation does not check public-origin reachability.
 
-The connection helper cancels its setup context after connection setup. Later queries use the context supplied by their caller.
+A whitespace-only management key fails startup. Redis configuration requires `STORAGE_BACKEND=postgres`.
 
-The service has no dependency on HTTP. It returns records or errors, preserving unexpected generator and repository errors with `%w`. The response helper recognizes wrapped application errors with `errors.Is`:
+Compose also requires `POSTGRES_ADMIN_PASSWORD`, `APP_DATABASE_PASSWORD`, and `COMPOSE_DATABASE_URL`. These variables configure the stack rather than the Go process directly.
 
-- `errInvalidURL` maps to 400.
-- `errInvalidAlias` and `errInvalidExpiry` map to 400.
-- `errAliasTaken` maps to 409.
-- `errCodeAllocationExhausted` maps to 503.
-- `errURLNotFound` maps to 404.
-- `errURLExpired` maps to 410.
-- `context.DeadlineExceeded`, including wrapped errors, maps to 503 with `request deadline exceeded` when reported through the response helper.
-- Unexpected service failures are logged internally and map to a generic 500 response.
+### Database pool settings
 
-Request-decoding errors remain in the create handler: oversized bodies map to 413 and other decoding failures to 400. Redirect and metadata handlers currently read from the repository directly.
+Pool settings can be included in `DATABASE_URL` or `COMPOSE_DATABASE_URL`:
 
-If caching is enabled, startup wraps PostgreSQL storage before handler construction. The wrapper implements `urlStore`. Handlers do not depend on Redis APIs.
+~~~text
+postgres://USER:ENCODED_PASSWORD@HOST:PORT/DATABASE?sslmode=disable&pool_max_conns=10
+~~~
 
-Startup retains the primary repository and assigns its analytics interfaces before wrapping lookup storage. Redirects receive the wrapped repository and primary click recorder. Statistics receive the primary repository and statistics reader. Deletion receives the wrapped repository for invalidation.
+The quick start uses ten connections per application process. This is a development example, not a measured optimum.
 
-The wrapper logs cache-read and cache-write failures. A successful primary lookup can still return successfully. A deletion invalidation failure returns an error. The generic HTTP mapping returns 500 for that error.
+Budget connections across all application instances. Leave capacity for migrations, administration, and other database clients.
 
-`writeJSON` sets Content-Type and commits the selected status before encoding. It logs encoding and write failures. After commitment, the helper cannot replace the response status.
+## Architecture
 
-## Development checks
+~~~mermaid
+flowchart LR
+    Client --> HTTP["Go HTTP server"]
+    HTTP --> Service["Creation service"]
+    Service --> Primary["Primary storage"]
+    HTTP --> Cache["Cache-aside URL lookup"]
+    Cache --> Redis["Optional Redis cache"]
+    Cache --> Primary
+    HTTP --> Analytics["Click recording and statistics"]
+    Analytics --> Primary
+~~~
 
-Run these commands yourself from the project root:
+Handlers translate HTTP requests and responses. The creation service validates input and allocates codes. Narrow interfaces separate storage, deletion, and analytics.
 
-```powershell
+### Storage and identity
+
+PostgreSQL enforces code uniqueness with a database constraint. Random-code creation retries collisions up to five times. Custom aliases use one insertion attempt.
+
+Records have stable IDs. Analytics use the ID rather than the reusable short code. PostgreSQL deletes daily counters through a cascading foreign key.
+
+The memory backend protects records, IDs, and counters with a shared lock. Memory data is lost when the process stops.
+
+### Cache behavior
+
+Creation writes to primary storage only. A lookup checks Redis first, then reads PostgreSQL on a miss and caches the returned record.
+
+Cache TTL is the smaller of five minutes and the remaining link lifetime. Permanent links still have a finite TTL. Hits do not refresh TTL.
+
+A Redis read or population failure does not discard a successful primary lookup. Cache operations use short child contexts.
+
+Deletion invalidates Redis before deleting from PostgreSQL. If invalidation fails, primary deletion stops. This prevents successful deletion from leaving a known cached record behind.
+
+Each process run uses a new Redis namespace. This avoids reading entries from a previous run. It does not coordinate invalidation between multiple active application instances.
+
+### Click statistics
+
+GET redirects synchronously record a click before sending `302`. HEAD, metadata, and statistics requests do not add clicks.
+
+A click represents a recorded redirect request. It does not confirm that the client reached the destination. Retries can add multiple clicks.
+
+Counters are grouped by UTC date. PostgreSQL increments daily counts atomically. Statistics remain available after expiry and are removed on deletion.
+
+Click recording does not use Redis or a background queue. A warm cache cannot make counted GET redirects succeed during a PostgreSQL outage.
+
+### Dependency failures
+
+| Condition | Metadata and HEAD | GET redirect | Statistics | Deletion |
+| --- | --- | --- | --- | --- |
+| Redis unavailable; PostgreSQL available | Primary fallback | Records click and redirects | Available | Fails while invalidation is unavailable |
+| PostgreSQL unavailable; active record cached | Can use cached record | Fails during click recording | Fails | Primary deletion fails |
+| PostgreSQL unavailable; cache miss | Fails | Fails | Fails | Fails |
+
+`/healthz` checks the process only. In PostgreSQL mode, `/readyz` calls `pool.Ping`. It does not verify the schema or Redis.
+
+## Local development
+
+### Run without containers
+
+Use memory storage for a minimal local server:
+
+~~~powershell
+$env:STORAGE_BACKEND = 'memory'
+$env:REDIS_URL = ''
+$env:HTTP_ADDR = '127.0.0.1:8080'
+$env:PUBLIC_BASE_URL = 'http://127.0.0.1:8080'
+go run ./cmd/server
+~~~
+
+For PostgreSQL mode, supply a reachable `DATABASE_URL` and apply both migrations first. Never use a PostgreSQL superuser as the application login.
+
+### Migrations
+
+The schema has two migration versions:
+
+| Version | Change |
+| --- | --- |
+| 1 | URL records, identity column, code uniqueness, and optional expiry |
+| 2 | Daily click counters, composite primary key, and cascading deletion |
+
+Compose applies pending migrations automatically before application startup. Run them separately with:
+
+~~~powershell
+docker compose run --rm migrate
+~~~
+
+Inspect the current version:
+
+~~~powershell
+docker compose exec postgres psql `
+    -h 127.0.0.1 -U url_shortener_dev -d url_shortener -W `
+    -c 'SELECT version, dirty FROM schema_migrations;'
+~~~
+
+Expect version `2` and `dirty = f`.
+
+The initialization script creates the application role only for a new database volume. Changing its password variable does not rotate an existing role password.
+
+A down migration can delete stored records or counters. Reapplying the up migration does not restore that data.
+
+## Tests
+
+Format code and run the standard checks:
+
+~~~powershell
 go fmt ./cmd/server
 go vet ./...
-go test -race -v ./...
-```
-
-### PostgreSQL integration tests
-
-Use a development or dedicated test database with migrations 1 and 2 applied. In the session containing `$localDatabaseURL`:
-
-```powershell
-$env:TEST_DATABASE_URL = $localDatabaseURL
 go test -race -count=1 -v ./...
-```
+~~~
 
-If that connection variable is not populated in this terminal, repeat the password-prompt setup above first. Integration tests skip when `TEST_DATABASE_URL` is absent. Look for PASS rather than SKIP on these tests:
+Integration tests skip when their test URL is unset. Configure host access to the Compose services in the quick-start terminal:
 
-- `TestOpenPostgresIntegration`
-- `TestPostgresStoreSaveLookupAndCollisionIntegration`
-- `TestPostgresStoreConcurrentInsertIntegration`
-- `TestPostgresStoreExpiryRoundTripIntegration`
-- `TestPostgresStoreDeleteIntegration`
-- `TestPostgresRecordClickIntegration`
-- `TestPostgresRecordClickConcurrentIntegration`
-
-The connection test runs `SELECT 1`. Repository tests create records with unique names. Cleanup removes those records, not the entire table. The concurrent test expects one successful insert and fifteen collisions for one code.
-
-Analytics tests check empty results, UTC grouping, direct SQL counts, reader results, and cascade deletion. The concurrent analytics test records 400 clicks through sixteen workers. Each worker records 25 clicks. Cleanup removes the test URL and its counters.
-
-Cleanup uses a new timeout context and completes before pool closure. The `-count=1` flag prevents reuse of cached test results.
-
-### Redis integration tests
-
-Keep Docker Desktop and the Redis container running, then configure the test terminal:
-
-```powershell
-$env:TEST_REDIS_URL = 'redis://127.0.0.1:6379/0'
+~~~powershell
+$env:TEST_DATABASE_URL = "postgres://url_shortener_dev:${encodedPassword}@127.0.0.1:5433/url_shortener?sslmode=disable&pool_max_conns=10"
+$env:TEST_REDIS_URL = 'redis://127.0.0.1:6380/0'
 go test -race -count=1 -v ./...
-```
+~~~
 
-Keep `TEST_DATABASE_URL` populated too to exercise both external services in one run. Redis integration tests skip when `TEST_REDIS_URL` is absent. Confirm PASS rather than SKIP for:
+Tests cover validation, strict decoding, collisions, expiry, authentication, cancellation, concurrency, cache failure, deletion, and analytics.
 
-- `TestRedisClientIntegration`: host-to-Redis PING.
-- `TestRedisCacheRoundTripIntegration`: misses, JSON/expiry round trip, positive bounded TTL, idempotent deletion, and skipped zero/negative/sub-millisecond TTLs.
-- `TestRedisCacheNamespaceIntegration`: the same code can hold different values in separate namespaces, and deleting one does not affect the other.
+Run the pool-limit check separately:
 
-The tests use generated keys and namespaces. They remove their own entries during cleanup. They do not clear Redis. Cache-wrapper unit tests use test doubles and need no external services.
+~~~powershell
+go test -race -count=1 -v `
+    -run '^TestPostgresPoolLimitIntegration$' ./cmd/server
+~~~
 
-Automated tests cover:
+This check holds two pool connections. A third acquisition must reach its deadline. A released connection must then support another query.
 
-- Store save/lookup, missing records, collision preservation, and concurrent access.
-- Valid and invalid destination URLs.
-- JSON decoding, unknown fields, trailing values, malformed input, and oversized bodies, including trailing whitespace.
-- Successful creation, rejected requests without storage changes, forced collision retries, and retry exhaustion.
-- Service behavior independent of HTTP: success, validation before generation, generator failure, repository failure, collision retries, and allocation exhaustion.
-- Preservation of wrapped errors with `errors.Is`, plus HTTP error mapping through a fake failing repository.
-- Exactly one JSON value in the successful create response, guarding against duplicate response writes.
-- Metadata responses and redirects for known and missing codes.
-- PostgreSQL connectivity, save/lookup, missing-record translation, duplicate-code preservation, and concurrent uniqueness enforcement.
-- Metadata and redirect handlers returning generic 500 responses without a redirect destination when repository lookup fails.
-- Alias length boundaries, characters, reserved names, capitalization preservation, conflicts, and no random fallback.
-- Optional alias/expiry decoding, including omitted versus explicit empty values, timestamp offsets, and invalid types.
-- Expiry normalization, caller-input preservation, past-deadline rejection, and before/at/after deadline boundaries.
-- Expiry returned and stored through both creation paths, PostgreSQL timestamp round trips, active metadata fields, and omission for permanent links.
-- Metadata and redirects returning 410 for expired links while retaining records.
-- Memory and PostgreSQL deletion, missing records, preservation of unrelated records, and reuse of deleted codes.
-- Delete-handler success, expiry-independent deletion, empty 204 bodies, and storage failures.
-- Authentication rejection, empty-key configuration, handler execution control, and actual record preservation during unauthorized deletion.
-- Cache TTL maximums, expiry boundaries, millisecond truncation, and skip-insertion cases.
-- Redis adapter operations, expiry serialization, finite TTLs, and namespace isolation.
-- Cache hits avoiding primary lookup and TTL refresh, fallback on misses/read errors, and successful reads despite cache-population errors.
-- Primary-error identity preservation, no cache population for primary failures, canceled requests, and primary-only saves.
-- Deletion operation order, invalidation failure preventing primary deletion, primary failure, and missing-record results through the wrapper.
-- Request-ID propagation, replacement of client-supplied IDs, context-value preservation, and parent cancellation.
-- Structured request logs for matched and unmatched routes through the full middleware chain, including ID correlation and duration-field presence.
-- Startup configuration errors returning from `run` for unknown backends and Redis configured with memory storage.
-- Readiness success, storage failure, request cancellation, deadline presence, safe response bodies, and non-cacheable responses.
-- Creation-limit configuration, sequential window boundaries, exactly ten allowed attempts under concurrent load, middleware rejection without downstream execution, and reset behavior.
-- Request-timeout inheritance, preservation of context values, child cleanup without canceling the parent, immediate expiry, and parent cancellation.
-- Direct and wrapped deadline errors mapping to a safe 503 response.
-- UTC analytics dates at midnight and across timezone offsets.
-- Positive stored IDs, preservation during collisions, distinct concurrent IDs, and new IDs after code reuse.
-- ID preservation through Redis serialization, cache hits, and primary fallback.
-- Memory analytics with zero counts, daily grouping, missing IDs, cancellation, deletion, and code reuse.
-- Exactly 400 recorded clicks from concurrent workers in both memory and PostgreSQL tests.
-- PostgreSQL daily counts checked through direct SQL and the statistics reader.
-- Cascade removal of counters and rejection of events for deleted PostgreSQL IDs.
-- Statistics JSON for empty, populated, and expired records, with ordered dates and an empty array for zero clicks.
-- Missing statistics records, skipped reader calls, safe reader errors, and the correct stored ID.
-- Repeated GET counting, uncounted HEAD, missing and expired requests, and empty HEAD response bodies.
-- Recording failures returning mapped errors without a redirect destination.
+### Continuous integration
 
-The developer reports passing tests with the race detector and no vet findings. The reported runs included real PostgreSQL and Redis integration tests.
+GitHub Actions checks formatting, vet, and race-enabled unit and integration tests. It starts real PostgreSQL and Redis services and applies migrations.
 
-Manual HTTP checks covered creation, aliases, metadata, redirects, expiry, and protected deletion. They also covered cache failure, recovery, invalidation, and code reuse. Module 6 checks covered readiness recovery, rate-limit reset, request logging, and header timeout.
+CI also runs the cold/warm benchmark and builds the Docker image. Container smoke checks cover:
 
-Direct handler tests do not automatically check route registration. Race checks apply to the executions tested. They do not prove correctness for all concurrent executions.
+- Health and readiness.
+- Creation, metadata, and redirect destinations.
+- Protected statistics and deletion.
+- HEAD behavior without click increments.
+- Persistence after application restart.
+- Missing records after deletion.
+- Clean container shutdown.
 
-The final Module 7 run passed with both `TEST_DATABASE_URL` and `TEST_REDIS_URL` set. The developer also confirmed typing the code, tests, and migrations and understanding synchronous recording.
+CI uses disposable fixture credentials. It stops services after success or failure. Benchmark results appear in the job log.
 
-### Coverage
+## Performance
 
-Generate and inspect statement coverage in PowerShell:
+### Run the benchmarks
 
-```powershell
-go test -race "-coverprofile=coverage.out" ./...
-go tool cover "-func=coverage.out"
-```
+Set both integration-test URLs before service benchmarks.
 
-Quote the complete flags as shown to avoid argument-parsing problems in PowerShell. The generated `coverage.out` file is ignored by Git.
+~~~powershell
+go test ./cmd/server -run '^$' `
+    -bench '^BenchmarkRedirectHandlerMemory$' -benchmem -count=5
 
-The Module 2 report dated October 21, 2026 showed **73.6% total statement coverage**. All tests passed. The service, repository, handlers, decoder, validator, and error mapping each showed 100%. `generateCode` and `writeJSON` each showed 75%. `main` showed 0%.
+go test ./cmd/server -run '^$' `
+    -bench '^BenchmarkRedirectHandlerMemoryParallel$' `
+    -benchmem '-cpu=1,2,4,8,16' -count=3
 
-This report predates PostgreSQL, lifecycle, Redis, safeguards, and analytics changes. It does not measure the current code. For a new report, set both `TEST_DATABASE_URL` and `TEST_REDIS_URL` before the coverage command.
+go test ./cmd/server -run '^$' `
+    -bench '^(BenchmarkPostgresLookup|BenchmarkRedisWarmLookup)$' `
+    -benchmem '-cpu=16' -count=5
 
-No current coverage figure has been reported. The historical report did not cover startup, shutdown, and some error branches. The developer checked startup and basic shutdown manually.
+go test ./cmd/server -run '^$' `
+    -bench '^BenchmarkCachedStoreLookup$' `
+    -benchmem '-benchtime=100x' -count=5
+~~~
 
-Coverage identifies executed statements. Assertions check results. Full statement coverage does not prove that all edge cases work.
+The cache-aside benchmark uses established connections for both paths:
 
-## Current limitations
+- `cold` removes and verifies the missing fixture key before each timed lookup. The lookup includes Redis, PostgreSQL, and cache population.
+- `warm` starts with a cached fixture. Any primary lookup fails the benchmark.
 
-- Memory storage has no capacity limit and is cleared on process exit. Persistence requires selecting the PostgreSQL backend.
-- The listen address and public short-link base URL are fixed in application setup.
-- The optional update endpoint is not implemented.
-- Synchronous recording adds a primary-storage write to each counted redirect. A PostgreSQL outage can block GET redirects despite a warm cache.
-- Counts represent recorded redirect requests, not unique visitors or confirmed destination visits. Retries can increase counts.
-- Daily statistics have no date-range filter, pagination, or automatic retention limit.
-- All clients share one creation limit within a process. Restart resets the limit. Window boundaries permit bursts. Separate processes have separate limits.
-- Cache coordination supports the current single-process setup, not distributed invalidation across multiple active servers or external database writers.
-- Redis outages allow read fallback but prevent deletion while invalidation is unavailable. Cache stampede prevention and performance benchmarks are not implemented.
-- One shared management key protects deletion and statistics. Per-user ownership and key rotation are not implemented.
-- The database stores an ID and creation timestamp, but metadata currently exposes only the code, original URL, and optional expiry.
-- Expired records are retained without automatic cleanup. Their codes remain reserved until explicit deletion, which releases the code for reuse.
-- `/healthz` does not test dependencies; `/readyz` checks primary connectivity but not schema or Redis. Unexpected database failures still map to 500; reported request deadlines map to 503.
-- Request deadlines are cooperative. Blocking body reads and code that ignores context are not forcibly stopped by the five-second middleware deadline.
-- Request access logs do not include response status or byte count. Some internal diagnostics still use unstructured logging.
+Reset and verification requests are outside timing. Cold results must report `1 primary/op`. Warm results must report `0 primary/op`.
 
-## Manual persistence and outage checks
+These benchmarks exclude HTTP and click writes. A cold key does not imply a cold process or PostgreSQL buffer cache.
 
-The developer reports verifying the following against local PostgreSQL, with Redis caching disabled for the original database-outage check:
+### Recorded baseline
 
-1. The developer created a PostgreSQL link and restarted only the Go server. The same code returned metadata status 200 and redirect status 302.
-2. The developer stopped PostgreSQL while Go remained running. Metadata and redirects returned 500. The health endpoint continued to return 200.
-3. The developer restarted PostgreSQL without a Go restart. The original link became available again. This check verified connection-pool recovery and stored-record persistence.
+The local benchmark host used Windows, Go 1.26.6, and an AMD Ryzen 7 5800H.
 
-For this Windows installation, the service is `postgresql-x64-18`. Confirm the service name before testing on another installation:
+| Benchmark | Runs | Median time per operation | Bytes per operation | Allocations per operation |
+| --- | --- | --- | --- | --- |
+| Memory redirect | 5 | 2.838 microseconds | 1264–1265 | 14 |
+| PostgreSQL lookup | 5 | 253.848 microseconds | 1652–1653 | 24 |
+| Warm Redis adapter lookup | 5 | 1.159125 milliseconds | 1216 | 18 |
 
-```powershell
-Get-Service -Name '*postgres*' | Select-Object Name, Status, DisplayName
-```
+The memory redirect includes an in-memory click increment and a new response recorder. It excludes the network, router, and middleware.
 
-Use a separate administrator PowerShell terminal for these commands. Stopping PostgreSQL affects all applications that use this instance. After the outage check, restore the service:
+PostgreSQL ran natively on Windows. Redis ran through Docker Desktop. Their different connection paths limit the adapter comparison.
 
-```powershell
-Stop-Service -Name 'postgresql-x64-18'
-# Inspect lookup failures in the request terminal, then restore PostgreSQL.
-Start-Service -Name 'postgresql-x64-18'
-```
+A four-processor mutex profile attributed 91.29 percent of contention delay to the memory `recordClick` stack. This is accumulated waiting time, not CPU time.
 
-Keep Go running in PostgreSQL mode during the check. Use `curl.exe --max-time 10 -i` to limit client waiting. The curl timeout limits the client. It does not set a database deadline. These service restart checks are manual.
+Parallel benchmark time per operation describes aggregate throughput. It does not measure individual request latency.
 
-### Redis behavior verified manually
+### Run the HTTP load test
 
-With PostgreSQL and Redis caching enabled, the developer verified:
+Create a permanent link with the API example. Prepare its statistics URL and warm the metadata cache:
 
-1. Creation writes only to primary storage. The first lookup creates a cache entry in the run namespace. Repeated lookup returns the correct destination while PTTL decreases.
-2. During a Redis outage, metadata and redirects still use PostgreSQL. Authorized deletion returns 500 and preserves the primary record. Redis recovery does not require a Go restart.
-3. Successful deletion returns 204 and removes the cache entry. Metadata and redirects then return 404. Code reuse returns the new destination instead of old cache data.
-4. A two-minute link receives a cache TTL below 120000 ms. After expiry, Redis has no key. Metadata and redirects return 410. Further expired lookups do not restore the cache entry.
-
-For a fresh link created using the earlier request example, inspect the cache from the request terminal:
-
-```powershell
+~~~powershell
+$loadDirectory = (Resolve-Path './load').Path
 $metadataURL = "http://127.0.0.1:8080/api/v1/urls/$($link.code)"
-$pattern = "url-shortener:v1:url:*:$($link.code)"
-curl.exe -i $metadataURL
+$managementHeaders = @{ Authorization = "Bearer $env:MANAGEMENT_API_KEY" }
+$statsURL = "$metadataURL/stats"
+curl.exe --fail --show-error -i $metadataURL
+$beforeCount = (Invoke-RestMethod -Uri $statsURL -Headers $managementHeaders).total_clicks
 
-$redisKey = docker exec url-shortener-redis redis-cli --scan --pattern $pattern
-$redisKey
-docker exec url-shortener-redis redis-cli PTTL $redisKey
-```
+docker run --rm `
+    --network url-shortener-dev_default `
+    --mount "type=bind,source=$loadDirectory,target=/scripts,readonly" `
+    --env BASE_URL=http://app:8080 `
+    --env "SHORT_CODE=$($link.code)" `
+    --env "EXPECTED_DESTINATION=$($link.url)" `
+    grafana/k6:1.4.0 run /scripts/redirect.js
 
-Use a code created during the current server run. Its pattern should identify the active key. PTTL uses milliseconds. A permanent link should have a positive PTTL no greater than 300000. An expiring link uses its shorter remaining lifetime. Cache hits do not extend the TTL.
+$afterCount = (Invoke-RestMethod -Uri $statsURL -Headers $managementHeaders).total_clicks
+$afterCount - $beforeCount
+~~~
 
-To repeat the Redis outage check, keep Go and PostgreSQL running:
+Use the default Compose project name for this network command. Adjust the network name if `COMPOSE_PROJECT_NAME` is set.
 
-```powershell
-docker stop url-shortener-redis
-curl.exe --max-time 10 -i $metadataURL
-curl.exe --max-time 10 -i $link.short_url
-```
+The script uses five virtual users for twenty seconds. Each iteration sends one GET and waits 100 milliseconds. It does not follow redirects.
 
-Expect 200 and 302 for an active link. Restore Redis even if a request differs from expectations:
+Every request must return `302` and the correct destination. The click increase should match the successful GET count.
 
-```powershell
-docker start url-shortener-redis
-docker exec url-shortener-redis redis-cli ping
-```
+To compare with caching disabled, recreate the app with the override:
 
-Use the deletion procedure to check failure and recovery. Expect 500 if invalidation fails. Expect 204 after recovery. These functional checks do not measure latency or throughput. Performance measurement is future work.
+~~~powershell
+docker compose -f compose.yaml -f compose.no-cache.yaml up --detach --no-deps app
+curl.exe --fail --show-error -i http://127.0.0.1:8080/readyz
+~~~
 
-### Analytics behavior verified manually
+Repeat the warm-up, count snapshot, and load command. Keep the link and workload unchanged.
 
-The developer verified these results with PostgreSQL and Redis enabled:
+Stopping Redis measures outage fallback, not normal operation with caching disabled. Restore the normal configuration after testing:
 
-1. Missing and incorrect management credentials returned 401 for statistics. Correct credentials returned 200, total zero, and an empty daily array.
-2. Three GET redirects returned 302 and produced total three. HEAD returned 302 without increasing the count. Metadata also left the count unchanged.
-3. Another GET produced total four. After a Go restart, statistics still showed four. A further GET increased the total to five.
-4. With Redis stopped, GET still returned 302 and increased the total to six. Statistics and metadata remained available through PostgreSQL.
-5. After Redis recovery, another GET increased the total to seven without a Go restart.
-6. With PostgreSQL stopped and the URL cached, metadata and HEAD remained available. Counted GET and statistics returned server errors. After recovery, the total remained seven.
-7. Deletion returned 204, then statistics returned 404. Code reuse returned 201 and total zero. One replacement GET returned the new destination and total one.
+~~~powershell
+docker compose -f compose.yaml up --detach --no-deps app
+~~~
 
-These are manual checks reported by the developer. They do not measure performance. No background analytics queue needs recovery or shutdown flushing.
+The first reported Compose comparison produced these results:
 
-## Shutdown and timeouts
+| Cache | GET requests | Median HTTP duration | p95 | p99 | Failed requests | Click increase |
+| --- | --- | --- | --- | --- | --- | --- |
+| Enabled | 955 | 4.01 ms | 6.76 ms | 9.32 ms | 0 | 955 |
+| Disabled | 955 | 3.97 ms | 6.27 ms | 8.31 ms | 0 | 955 |
 
-Press **Ctrl+C** in the server terminal. Expected log messages include:
+Both runs passed all 1910 checks. Each GET still required a PostgreSQL click write.
 
-```text
-Shutdown requested
-Server stopped cleanly
-```
+This paced workload did not measure maximum capacity. One comparison does not establish a consistent cache benefit.
 
-Shutdown stops new connections. Active requests have up to five seconds to finish. If shutdown exceeds this deadline, the process logs an error and exits. Unfinished requests can be interrupted. A second Ctrl+C can stop the process during shutdown.
+### Verification status
 
-After shutdown, this command should fail to connect:
+The existing deployment smoke checks passed in GitHub Actions. Local vet and race-enabled tests passed after the new benchmark and pool test were added.
 
-```powershell
-curl.exe -i http://127.0.0.1:8080/healthz
-```
+The new real-service pool check and cache-aside measurements still need a service-enabled run. No results are claimed for skipped checks.
 
-The configured limits are:
+## Operations
 
-| Limit | Duration | Scope |
-| --- | --- | --- |
-| `ReadHeaderTimeout` | 5 seconds | Reading request headers |
-| `ReadTimeout` | 10 seconds | Reading the complete request, including its body |
-| `WriteTimeout` | 15 seconds | Response-write deadline, reset when request headers are read |
-| `IdleTimeout` | 60 seconds | Waiting for the next request on a keep-alive connection |
-| Request context | 5 seconds | Cooperative downstream work after middleware begins |
-| Readiness context | 1 second | Primary-storage connectivity check |
-| Shutdown context | 5 seconds | Waiting for active HTTP requests to finish |
+### Logs and request IDs
 
-Connection timeouts and context deadlines have different purposes. A write deadline does not automatically cancel a PostgreSQL query. Handlers pass the request context to storage. Context-aware operations can stop at its deadline. Readiness uses an earlier one-second deadline.
+The server returns `X-Request-ID`. The same ID appears in request logs with the method, route pattern, and duration.
 
-The timeout middleware does not write a response automatically. It does not forcibly stop code. The response helper maps reported `context.DeadlineExceeded` errors to 503 before response commitment. A timed-out write can still have committed in primary storage.
+Startup, access, and shutdown logs use JSON. Some internal diagnostics still use standard text logging.
 
-Redis child contexts derive from the request context. Primary queries after a cache failure retain the outer request deadline. Locks do not observe context cancellation. Thus, the deadline does not guarantee a maximum total processing time.
+~~~powershell
+docker compose logs --follow app
+~~~
 
-The `run(logger)` function owns resources. It returns startup, serving, and shutdown errors. Its deferred cleanup executes before `main` logs the error and exits with code 1.
+### Timeouts and rate limiting
 
-On normal shutdown, the Redis client and PostgreSQL pool close after HTTP shutdown. If graceful shutdown times out, cleanup still executes as `run` returns. This cleanup can interrupt active work. Only `main` exits the process.
+| Limit | Value |
+| --- | --- |
+| Request headers | 5 seconds |
+| Complete request read | 10 seconds |
+| Response write | 15 seconds |
+| Idle connection | 60 seconds |
+| Request context | 5 seconds |
+| Readiness check | 1 second |
+| Cache operation context | 200 milliseconds |
+| Graceful HTTP shutdown | 5 seconds |
+| Compose stop grace period | 10 seconds |
 
-The developer sent incomplete headers through a real TCP connection. The server closed the connection after approximately five seconds. `ReadByte` returned `-1` after 4.9995 seconds. A subsequent health request returned 200.
+Context deadlines are cooperative. A write timeout does not cancel a database query automatically. Storage operations receive the request context.
 
-Direct handler tests do not check connection timeouts. Slow-body, slow-response, and idle-connection behavior have no separate verification.
+Creation allows ten attempts per minute in one shared process window. Invalid requests also consume attempts. Excess attempts return `429`.
 
-The developer checked basic shutdown and connection refusal manually. Completion of an active request during shutdown has not been verified.
+This limit is not per user or distributed across instances.
 
-## Learning workflow
+### Shutdown and data retention
 
-The developer types project code, configuration, tests, and migrations. The developer runs commands, tests, and Git operations. The assistant explains concepts and reviews code.
+Use Ctrl+C for the local server. Containers handle SIGTERM.
 
-Use [ASD-STE100](https://www.asd-ste100.org/assets/files/ASD-STE100_ISSUE9.pdf) writing principles for documentation. Write short sentences. Give one instruction in each sentence. Use consistent technical terms. Preserve exact code identifiers, commands, and protocol values. Full compliance requires a separate review against the approved dictionary.
+~~~powershell
+docker compose stop --timeout 10 app
+docker compose logs app
+docker compose down --remove-orphans
+~~~
 
-The developer authorized direct edits to `README.md` only. Other files remain under the manual learning rules. The developer reviews the documentation before the milestone commit.
+Normal shutdown logs `Shutdown requested` and `Server stopped cleanly`. The process closes clients after HTTP shutdown.
+
+The named PostgreSQL volume remains after `docker compose down`. Do not add `--volumes` unless you intend to delete the database.
+
+Redis persistence is disabled. Cache loss does not remove URL records or statistics.
+
+## Security and limitations
+
+- Management uses one shared bearer key. Per-user ownership and automatic key rotation are not implemented.
+- Creation and redirects are public. Deploy HTTPS through a reverse proxy for external access.
+- URL validation permits localhost and private-network destinations. The server sends redirects; it does not fetch or verify destinations.
+- Cache invalidation coordinates one process only. Multiple active instances and external database writes can leave stale entries until TTL expiry.
+- Concurrent cache misses are not coalesced.
+- Expired links remain stored until explicit deletion.
+- Statistics have no date filters, pagination, or retention policy.
+- Synchronous click writes add PostgreSQL work to every GET redirect.
+- Counters do not provide unique-visitor or exactly-once metrics.
+- Readiness checks connectivity, not schema correctness or Redis availability.
+- Request logs do not include response status or byte count.
+- No production latency or capacity guarantee has been established.
+
+## Repository layout
+
+~~~text
+cmd/server/                 HTTP server, service, storage, middleware, tests, benchmarks
+migrations/                 Versioned PostgreSQL schema changes
+docker/postgres/            First-start application-role setup
+load/redirect.js            k6 redirect workload
+.github/workflows/ci.yaml   Tests, benchmarks, image build, and container smoke checks
+Dockerfile                  Static Linux build and non-root runtime
+compose.yaml                Local application, PostgreSQL, migrations, and Redis
+compose.no-cache.yaml       Application override that disables Redis caching
+~~~

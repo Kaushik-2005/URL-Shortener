@@ -52,6 +52,12 @@ jobs:
       - name: Run unit and integration tests
         run: go test -race -count=1 -v ./...
 
+      - name: Measure cold and warm cache-aside lookups
+        run: >-
+          go test ./cmd/server -run '^$'
+          -bench '^BenchmarkCachedStoreLookup$'
+          -benchmem -benchtime=100x -count=5
+
       - name: Build and start application
         run: docker compose up --detach --build app
 
