@@ -77,6 +77,106 @@ jobs:
           curl --fail --silent --show-error --max-time 5 \
             http://127.0.0.1:8080/healthz
 
+      - name: Check URL creation, redirects, statistics, and deletion
+        shell: bash
+        run: |
+          base_url=http://127.0.0.1:8080
+          destination=https://example.com/ci-smoke
+          body_file="$RUNNER_TEMP/smoke-body.json"
+          headers_file="$RUNNER_TEMP/smoke-headers.txt"
+
+          expect_status() {
+            local expected="$1"
+            shift
+            local actual
+            actual=$(curl --silent --show-error --max-time 10 \
+              --output "$body_file" --dump-header "$headers_file" \
+              --write-out '%{http_code}' "$@")
+            if [ "$actual" != "$expected" ]; then
+              printf 'HTTP status: got %s, want %s\n' "$actual" "$expected"
+              cat "$body_file"
+              return 1
+            fi
+          }
+
+          expect_status 201 \
+            --header 'Content-Type: application/json' \
+            --data '{"url":"https://example.com/ci-smoke"}' \
+            "$base_url/api/v1/urls"
+
+          code=$(jq --exit-status --raw-output \
+            '.code | select(type == "string" and length > 0)' "$body_file")
+          jq --exit-status --arg url "$destination" \
+            --arg short_url "$base_url/$code" \
+            '.url == $url and .short_url == $short_url' "$body_file"
+          metadata_url="$base_url/api/v1/urls/$code"
+
+          expect_status 200 "$metadata_url"
+          jq --exit-status --arg code "$code" --arg url "$destination" \
+            '.code == $code and .url == $url' "$body_file"
+
+          expect_status 302 "$base_url/$code"
+          tr -d '\r' < "$headers_file" | grep --fixed-strings --line-regexp \
+            "Location: $destination"
+
+          expect_status 302 --head "$base_url/$code"
+          tr -d '\r' < "$headers_file" | grep --fixed-strings --line-regexp \
+            "Location: $destination"
+
+          expect_status 401 "$metadata_url/stats"
+          expect_status 401 --request DELETE "$metadata_url"
+          expect_status 200 \
+            --header "Authorization: Bearer $MANAGEMENT_API_KEY" \
+            "$metadata_url/stats"
+          jq --exit-status --arg code "$code" \
+            '.code == $code and .total_clicks == 1 and
+             (.daily | length) == 1 and .daily[0].clicks == 1' "$body_file"
+
+          docker compose restart app
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --max-time 2 \
+              "$base_url/readyz"; then
+              break
+            fi
+            sleep 1
+          done
+          expect_status 200 "$base_url/readyz"
+
+          expect_status 200 "$metadata_url"
+          jq --exit-status --arg code "$code" --arg url "$destination" \
+            '.code == $code and .url == $url' "$body_file"
+          expect_status 200 \
+            --header "Authorization: Bearer $MANAGEMENT_API_KEY" \
+            "$metadata_url/stats"
+          jq --exit-status --arg code "$code" \
+            '.code == $code and .total_clicks == 1 and
+             (.daily | length) == 1 and .daily[0].clicks == 1' "$body_file"
+
+          expect_status 204 --request DELETE \
+            --header "Authorization: Bearer $MANAGEMENT_API_KEY" \
+            "$metadata_url"
+          test ! -s "$body_file"
+          expect_status 404 "$metadata_url"
+          expect_status 404 "$base_url/$code"
+          expect_status 404 \
+            --header "Authorization: Bearer $MANAGEMENT_API_KEY" \
+            "$metadata_url/stats"
+
+      - name: Check graceful container shutdown
+        shell: bash
+        run: |
+          container_id=$(docker compose ps --all --quiet app)
+          test -n "$container_id"
+          started_at=$(docker inspect --format '{{.State.StartedAt}}' "$container_id")
+          docker compose stop --timeout 10 app
+          exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_id")
+          if [ "$exit_code" != 0 ]; then
+            printf 'Application exit code: got %s, want 0\n' "$exit_code"
+            exit 1
+          fi
+          docker logs --since "$started_at" "$container_id" 2>&1 | grep --fixed-strings \
+            'Server stopped cleanly'
+
       - name: Show service logs on failure
         if: failure()
         run: docker compose logs --no-color --tail 100 app migrate postgres redis
