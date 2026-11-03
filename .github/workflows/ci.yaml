@@ -11,7 +11,7 @@ permissions:
 jobs:
   checks:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     env:
       COMPOSE_PROJECT_NAME: url-shortener-ci
@@ -52,9 +52,34 @@ jobs:
       - name: Run unit and integration tests
         run: go test -race -count=1 -v ./...
 
+      - name: Build and start application
+        run: docker compose up --detach --build app
+
+      - name: Check application readiness and health
+        shell: bash
+        run: |
+          ready=false
+
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error --max-time 2 \
+              http://127.0.0.1:8080/readyz; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" != true ]; then
+            echo "Application did not become ready"
+            exit 1
+          fi
+
+          curl --fail --silent --show-error --max-time 5 \
+            http://127.0.0.1:8080/healthz
+
       - name: Show service logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail 100 postgres redis
+        run: docker compose logs --no-color --tail 100 app migrate postgres redis
 
       - name: Stop integration services
         if: always()
